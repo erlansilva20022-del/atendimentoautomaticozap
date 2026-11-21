@@ -12,8 +12,34 @@ const fs = require('fs');
 const path = require('path');
 const dbMod = require('./db');
 const { sha256Buffer } = require('./hash');
+const { makePreview } = require('./watermark');
 const { OrderService, detectLanguage } = require('./orders');
 const { config, originalsDir } = require('./config');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Valida a assinatura real do arquivo (magic bytes) — não confia só no base64 nem na extensão.
+// Retorna { ext, mime } ou null quando o conteúdo não é JPEG, PNG ou WebP.
+function detectImageType(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { ext: 'jpg', mime: 'image/jpeg' };
+  }
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+    bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a
+  ) {
+    return { ext: 'png', mime: 'image/png' };
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes.toString('ascii', 0, 4) === 'RIFF' &&
+    bytes.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    return { ext: 'webp', mime: 'image/webp' };
+  }
+  return null;
+}
 
 function fingerprint(phone, observedClock, text) {
   return crypto.createHash('sha256').update(`${phone}|${observedClock}|${text}`).digest('hex');
@@ -32,10 +58,20 @@ function createBridgeRouter(db, whatsapp) {
   const service = new OrderService(db);
 
   // Cria ou recupera um pedido a partir de uma mensagem observada no WhatsApp.
+  // Aceita orderId opcional: quando informado um UUID válido e o pedido já existe,
+  // ele é vinculado (não cria outro); quando não existe, o pedido é criado COM esse UUID
+  // — é assim que o pedido de teste existente (ex.: 92402128-...) é importado para o banco novo.
   router.post('/api/muse/orders', (req, res) => {
-    const { phone, observedClock, text } = req.body || {};
+    const { phone, observedClock, text, orderId } = req.body || {};
     if (!phone || !observedClock || !text) {
       return res.status(400).json({ ok: false, error: 'phone, observedClock e text são obrigatórios' });
+    }
+    if (orderId && !UUID_RE.test(orderId)) {
+      return res.status(400).json({ ok: false, error: 'orderId inválido (esperado UUID)' });
+    }
+    if (orderId) {
+      const linked = dbMod.getOrder(db, orderId);
+      if (linked) return res.json({ ok: true, orderId, status: linked.status, duplicate: true, linked: true });
     }
     const fp = fingerprint(phone, observedClock, text);
     const existing = db.prepare('SELECT * FROM orders WHERE phone = ? ORDER BY created_at DESC LIMIT 1').get(phone);
@@ -44,7 +80,10 @@ function createBridgeRouter(db, whatsapp) {
       if (ev) return res.json({ ok: true, orderId: existing.id, status: existing.status, duplicate: true });
     }
     const language = detectLanguage(phone);
-    const order = dbMod.createOrder(db, { phone, language });
+    const order = orderId
+      ? dbMod.createOrderWithId(db, { id: orderId, phone, language })
+      : dbMod.createOrder(db, { phone, language });
+    if (orderId) dbMod.logEvent(db, order.id, 'pedido_importado', `uuid existente vinculado: ${orderId}`);
     dbMod.logEvent(db, order.id, 'pedido_observado', fp);
     dbMod.logEvent(db, order.id, 'texto_pedido', String(text).slice(0, 500));
     dbMod.transition(db, order.id, 'CONTATO_VALIDADO');
@@ -52,14 +91,25 @@ function createBridgeRouter(db, whatsapp) {
   });
 
   // Recebe o resultado da geração do Muse: bytes da imagem + hash para validação.
+  // Aceita base64 puro (preferido pela ponte) ou dataUrl. Valida SHA-256 e a assinatura
+  // real do arquivo (JPEG/PNG/WebP). Salva o original, GERA a prévia com marca e registra
+  // as duas fotos (kind 'final' e kind 'preview') — sem a prévia registrada, o envio falharia.
+  // Se o pedido ainda não existe neste banco, ele é criado com o UUID informado (importação).
   router.post('/api/muse/order-result', async (req, res) => {
     const { orderId, phone, source, sourceSha256, image } = req.body || {};
     if (source !== 'MUSE') return res.status(400).json({ ok: false, error: 'source deve ser "MUSE"' });
-    if (!orderId || !sourceSha256 || !image) {
-      return res.status(400).json({ ok: false, error: 'orderId, sourceSha256 e image são obrigatórios' });
+    if (config.bridgeToken && req.headers['x-bridge-token'] !== config.bridgeToken) {
+      return res.status(401).json({ ok: false, error: 'x-bridge-token inválido' });
     }
-    const order = dbMod.getOrder(db, orderId);
-    if (!order) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
+    if (!orderId || !UUID_RE.test(orderId) || !sourceSha256 || !image) {
+      return res.status(400).json({ ok: false, error: 'orderId (UUID), sourceSha256 e image são obrigatórios' });
+    }
+    let order = dbMod.getOrder(db, orderId);
+    if (!order) {
+      if (!phone) return res.status(404).json({ ok: false, error: 'pedido não encontrado — informe phone para importar o UUID' });
+      order = dbMod.createOrderWithId(db, { id: orderId, phone, language: detectLanguage(phone) });
+      dbMod.logEvent(db, orderId, 'pedido_importado', `uuid existente vinculado via order-result: ${orderId}`);
+    }
     if (phone && order.phone !== phone) {
       return res.status(400).json({ ok: false, error: 'phone não confere com o pedido' });
     }
@@ -76,16 +126,29 @@ function createBridgeRouter(db, whatsapp) {
     if (hash !== sourceSha256) {
       return res.status(400).json({ ok: false, error: 'sha256 não confere com os bytes recebidos', receivedSha256: hash });
     }
+    const type = detectImageType(bytes);
+    if (!type) {
+      return res.status(400).json({ ok: false, error: 'tipo de imagem não reconhecido (esperado JPEG, PNG ou WebP)' });
+    }
     // Anti-duplicação: mesmo pedido + mesmo hash já registrado.
     const dup = dbMod.listPhotos(db, orderId, 'final').find((p) => p.sha256 === hash);
     if (dup) return res.json({ ok: true, orderId, status: order.status, sha256: hash, duplicate: true });
     fs.mkdirSync(originalsDir, { recursive: true });
-    const filePath = path.join(originalsDir, `${orderId}_original.jpg`);
+    const filePath = path.join(originalsDir, `${orderId}_original.${type.ext}`);
     fs.writeFileSync(filePath, bytes);
     dbMod.addPhoto(db, orderId, { kind: 'final', path: filePath, sha256: hash, bytes: bytes.length });
-    dbMod.logEvent(db, orderId, 'imagem_muse_recebida', `sha256=${hash} bytes=${bytes.length}`);
+    dbMod.logEvent(db, orderId, 'imagem_muse_recebida', `sha256=${hash} bytes=${bytes.length} tipo=${type.mime}`);
+    // Cria a prévia com marca E registra kind 'preview' — o envio usa essa foto.
+    const previewPath = await makePreview(filePath);
+    const previewBytes = fs.readFileSync(previewPath);
+    dbMod.addPhoto(db, orderId, {
+      kind: 'preview',
+      path: previewPath,
+      sha256: sha256Buffer(previewBytes),
+      bytes: previewBytes.length,
+    });
+    dbMod.logEvent(db, orderId, 'previa_criada', `${previewPath} bytes=${previewBytes.length}`);
     // Avança a máquina de estados sem pular etapas.
-    const cur = dbMod.getOrder(db, orderId).status;
     const steps = ['ORIGINAL_BAIXADA', 'REFERENCIAS_VALIDAS', 'PREVIA_GERADA', 'PREVIA_BAIXADA'];
     for (const step of steps) {
       const now = dbMod.getOrder(db, orderId).status;
@@ -93,7 +156,7 @@ function createBridgeRouter(db, whatsapp) {
       if (!dbMod.transition(db, orderId, step)) break;
     }
     const updated = dbMod.getOrder(db, orderId);
-    return res.json({ ok: true, orderId, status: updated.status, sha256: hash, bytes: bytes.length, path: filePath });
+    return res.json({ ok: true, orderId, status: updated.status, sha256: hash, bytes: bytes.length, path: filePath, previewPath });
   });
 
   // Status completo do pedido.

@@ -114,6 +114,12 @@ function applyTransition(db, orderId, from, to) {
 
 function createOrder(db, { phone, name = null, language = 'pt' }) {
   const id = randomUUID();
+  return createOrderWithId(db, { id, phone, name, language });
+}
+
+// Cria um pedido com um UUID já existente (ex.: importado do banco antigo da FC Bridge).
+// Usado para vincular o pedido de teste 92402128-07de-4e51-8c99-cf5d145fc3ab em vez de criar outro.
+function createOrderWithId(db, { id, phone, name = null, language = 'pt' }) {
   const now = nowIso();
   db.prepare(
     'INSERT INTO orders (id, phone, name, language, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -191,6 +197,7 @@ module.exports = {
   logEvent,
   transition,
   createOrder,
+  createOrderWithId,
   getOrder,
   findOpenOrderByPhone,
   updateOrder,

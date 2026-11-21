@@ -4,7 +4,8 @@ require('dotenv').config();
 const path = require('path');
 
 const config = {
-  port: parseInt(process.env.PORT || '3007', 10),
+  // Porta padrão 3008: a 3007 já é da FC Bridge 0.5.8 — nunca suba os dois na mesma porta.
+  port: parseInt(process.env.PORT || '3008', 10),
   sessionPath: process.env.WHATSAPP_SESSION_PATH || './session',
   quackApiKey: process.env.QUACK_API_KEY || '',
   quackApiUrl: process.env.QUACK_API_URL || '',
@@ -12,7 +13,14 @@ const config = {
   databasePath: process.env.DATABASE_PATH || './data/fc-pedidos.db',
   museInboxDir: process.env.MUSE_INBOX_DIR || './storage/muse-inbox',
   adminToken: process.env.ADMIN_TOKEN || '',
-  version: '1.0.0',
+  // Token opcional da ponte: se configurado, /api/muse/order-result exige o header x-bridge-token.
+  bridgeToken: process.env.BRIDGE_TOKEN || '',
+  // Cliente WhatsApp próprio: desligue (WHATSAPP_ENABLED=false) se outro sistema já usa a sessão.
+  whatsappEnabled: process.env.WHATSAPP_ENABLED !== 'false',
+  // Respostas automáticas no WhatsApp: DESLIGADO por padrão enquanto o Muse é o atendente
+  // principal — ligar (AUTO_REPLY_ENABLED=true) só quando este sistema assumir o atendimento.
+  autoReplyEnabled: process.env.AUTO_REPLY_ENABLED === 'true',
+  version: '1.1.0',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };

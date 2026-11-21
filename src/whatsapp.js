@@ -24,6 +24,7 @@ function isBlockedChat(chat) {
 }
 
 async function sendPreview(orderId) {
+  if (!client) throw new Error('WhatsApp não conectado — verifique WHATSAPP_ENABLED e o QR Code');
   const order = dbMod.getOrder(db, orderId);
   if (!order) throw new Error(`Pedido não encontrado: ${orderId}`);
   const previews = dbMod.listPhotos(db, orderId, 'preview');
@@ -40,6 +41,7 @@ async function sendPreview(orderId) {
 }
 
 async function sendFinal(orderId) {
+  if (!client) throw new Error('WhatsApp não conectado — verifique WHATSAPP_ENABLED e o QR Code');
   const order = dbMod.getOrder(db, orderId);
   if (!order) throw new Error(`Pedido não encontrado: ${orderId}`);
   if (order.status !== 'PAGAMENTO_CONFIRMADO') {
@@ -140,6 +142,18 @@ function startWhatsApp(database) {
   db = database;
   service = new OrderService(db);
 
+  // Cliente próprio desligado (WHATSAPP_ENABLED=false): o servidor HTTP e a ponte
+  // continuam funcionando; só não há conexão com o WhatsApp neste processo.
+  if (!config.whatsappEnabled) {
+    console.log('[whatsapp] Desligado por configuração (WHATSAPP_ENABLED=false) — servidor e ponte seguem ativos.');
+    return null;
+  }
+  // Respostas automáticas desligadas por padrão (AUTO_REPLY_ENABLED=false): enquanto o
+  // Muse for o atendente principal, este cliente NÃO responde clientes sozinho — evita
+  // atendimento duplicado. O envio de prévia/HD pela API continua funcionando.
+  if (!config.autoReplyEnabled) {
+    console.log('[whatsapp] Respostas automáticas DESLIGADAS (AUTO_REPLY_ENABLED=false) — o Muse atende; este sistema só envia prévia/HD por API.');
+  }
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: config.sessionPath }),
     puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
@@ -156,6 +170,11 @@ function startWhatsApp(database) {
   client.on('message', async (msg) => {
     try {
       if (msg.fromMe || msg.isStatus) return;
+      // Atendimento automático desligado: só registra a chegada, não responde nem gera nada.
+      if (!config.autoReplyEnabled) {
+        console.log(`[whatsapp] Mensagem recebida (auto-reply off, sem resposta): ${msg.from} ${msg.type}`);
+        return;
+      }
       const phone = msg.from.replace('@c.us', '');
       const order = service.getOrCreateOrder(phone, msg._data?.notifyName || null);
 
