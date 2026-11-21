@@ -68,8 +68,8 @@ Na primeira vez, aparece um **QR Code no terminal**: escaneie com o WhatsApp
 Business do celular (o mesmo número do atendimento). A sessão fica salva na
 pasta `session/` — não apague.
 
-- Dashboard: http://localhost:3007
-- Health: http://localhost:3007/health
+- Dashboard: http://localhost:3008
+- Health: http://localhost:3008/health
 
 ## Endpoints (API)
 

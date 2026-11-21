@@ -15,12 +15,13 @@ const config = {
   adminToken: process.env.ADMIN_TOKEN || '',
   // Token opcional da ponte: se configurado, /api/muse/order-result exige o header x-bridge-token.
   bridgeToken: process.env.BRIDGE_TOKEN || '',
-  // Cliente WhatsApp próprio: desligue (WHATSAPP_ENABLED=false) se outro sistema já usa a sessão.
-  whatsappEnabled: process.env.WHATSAPP_ENABLED !== 'false',
+  // Cliente WhatsApp próprio: DESLIGADO por padrão (WHATSAPP_ENABLED=true para ligar).
+  // Enquanto o Muse é o atendente, este processo não deve abrir outra sessão de WhatsApp.
+  whatsappEnabled: process.env.WHATSAPP_ENABLED === 'true',
   // Respostas automáticas no WhatsApp: DESLIGADO por padrão enquanto o Muse é o atendente
   // principal — ligar (AUTO_REPLY_ENABLED=true) só quando este sistema assumir o atendimento.
   autoReplyEnabled: process.env.AUTO_REPLY_ENABLED === 'true',
-  version: '1.1.0',
+  version: '1.1.1',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };
