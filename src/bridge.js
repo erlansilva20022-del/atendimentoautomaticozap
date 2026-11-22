@@ -1,8 +1,11 @@
 // Ponte HTTP para o handoff do Muse (FC Bridge).
 // - POST /api/muse/orders: cria/recupera pedido por telefone + hora observada + texto
-//   (sem messageId nativo — usa fingerprint telefone+hora+texto).
+//   (sem messageId nativo — usa fingerprint telefone+hora+texto; aceita orderId para importar UUID).
 // - POST /api/muse/order-result: recebe os bytes da imagem gerada pelo Muse
-//   (dataUrl ou base64), confere o SHA-256 e salva o original.
+//   (dataUrl ou base64 puro), confere o SHA-256 e a assinatura do arquivo, salva o original
+//   e cria/registra a prévia com marca. Protegido por requireBridge quando BRIDGE_TOKEN existe.
+// - GET /api/orders/:id/preview-file: baixa a prévia com marca (protegido, usado pela extensão).
+// - POST /api/orders/:id/mark-preview-sent: registra o envio confirmado pela extensão (protegido).
 // - GET /api/orders/:id: status, fotos e eventos.
 // - POST /api/orders/:id/confirm-payment e /send-preview: só com ADMIN_TOKEN.
 // Anti-duplicação por orderId + sha256 em todas as rotas.
@@ -17,6 +20,17 @@ const { OrderService, detectLanguage } = require('./orders');
 const { config, originalsDir } = require('./config');
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Middleware da ponte (contribuição local do GPT, incorporada na v1.2.0):
+// se BRIDGE_TOKEN não está configurado, libera; se está, exige o header x-bridge-token.
+// Protege as rotas que a extensão usa para buscar a prévia e registrar o envio.
+function requireBridge(req, res, next) {
+  if (!config.bridgeToken) return next();
+  if (req.headers['x-bridge-token'] !== config.bridgeToken) {
+    return res.status(401).json({ ok: false, error: 'x-bridge-token inválido' });
+  }
+  next();
+}
 
 // Valida a assinatura real do arquivo (magic bytes) — não confia só no base64 nem na extensão.
 // Retorna { ext, mime } ou null quando o conteúdo não é JPEG, PNG ou WebP.
@@ -95,12 +109,9 @@ function createBridgeRouter(db, whatsapp) {
   // real do arquivo (JPEG/PNG/WebP). Salva o original, GERA a prévia com marca e registra
   // as duas fotos (kind 'final' e kind 'preview') — sem a prévia registrada, o envio falharia.
   // Se o pedido ainda não existe neste banco, ele é criado com o UUID informado (importação).
-  router.post('/api/muse/order-result', async (req, res) => {
+  router.post('/api/muse/order-result', requireBridge, async (req, res) => {
     const { orderId, phone, source, sourceSha256, image } = req.body || {};
     if (source !== 'MUSE') return res.status(400).json({ ok: false, error: 'source deve ser "MUSE"' });
-    if (config.bridgeToken && req.headers['x-bridge-token'] !== config.bridgeToken) {
-      return res.status(401).json({ ok: false, error: 'x-bridge-token inválido' });
-    }
     if (!orderId || !UUID_RE.test(orderId) || !sourceSha256 || !image) {
       return res.status(400).json({ ok: false, error: 'orderId (UUID), sourceSha256 e image são obrigatórios' });
     }
@@ -109,6 +120,9 @@ function createBridgeRouter(db, whatsapp) {
       if (!phone) return res.status(404).json({ ok: false, error: 'pedido não encontrado — informe phone para importar o UUID' });
       order = dbMod.createOrderWithId(db, { id: orderId, phone, language: detectLanguage(phone) });
       dbMod.logEvent(db, orderId, 'pedido_importado', `uuid existente vinculado via order-result: ${orderId}`);
+      // Sem esta transição o pedido ficaria em NOVO e os avanços seguintes seriam rejeitados
+      // (a máquina de estados não permite pular CONTATO_VALIDADO).
+      dbMod.transition(db, orderId, 'CONTATO_VALIDADO');
     }
     if (phone && order.phone !== phone) {
       return res.status(400).json({ ok: false, error: 'phone não confere com o pedido' });
@@ -166,6 +180,31 @@ function createBridgeRouter(db, whatsapp) {
     return res.json({ ok: true, order: status });
   });
 
+  // Baixa a prévia com marca do pedido (rota protegida, usada pela extensão).
+  // Retorna o arquivo JPEG da prévia mais recente.
+  router.get('/api/orders/:id/preview-file', requireBridge, (req, res) => {
+    const order = dbMod.getOrder(db, req.params.id);
+    if (!order) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
+    const previews = dbMod.listPhotos(db, req.params.id, 'preview');
+    if (previews.length === 0) return res.status(404).json({ ok: false, error: 'prévia ainda não gerada' });
+    const preview = previews[previews.length - 1];
+    if (!fs.existsSync(preview.path)) return res.status(404).json({ ok: false, error: 'arquivo da prévia não encontrado' });
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${req.params.id}_previa.jpg"`);
+    return res.sendFile(path.resolve(preview.path));
+  });
+
+  // Registra o envio da prévia confirmado pela extensão (rota protegida).
+  // A extensão só chama depois de confirmar o balão de foto no WhatsApp.
+  router.post('/api/orders/:id/mark-preview-sent', requireBridge, (req, res) => {
+    try {
+      const order = service.markPreviewSent(req.params.id);
+      return res.json({ ok: true, order });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+  });
+
   // Lista resumida de pedidos (dashboard).
   router.get('/api/orders', (req, res) => {
     const orders = dbMod.listOrders(db, 100).map((o) => ({
@@ -210,4 +249,4 @@ function createBridgeRouter(db, whatsapp) {
   return router;
 }
 
-module.exports = { createBridgeRouter, fingerprint, requireAdmin };
+module.exports = { createBridgeRouter, fingerprint, requireAdmin, requireBridge };
