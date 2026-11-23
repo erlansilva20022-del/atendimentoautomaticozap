@@ -29,6 +29,10 @@
 // reserva ANTES de clicar no WhatsApp; mark-preview-sent/mark-final-sent só
 // confirmam com o reservationId + whatsappMessageId, dentro do TTL e com o lease
 // ainda válido. Sem reserva, não há confirmação no fluxo automático.
+// FC Core v2.1.2: envio incerto registrado no Core (POST /api/sends/uncertain) —
+// a extensão registra o 'uncertain' IMEDIATAMENTE após um clique sem confirmação;
+// o Core invalida a reserva (nenhum confirm nem renew com ela passa mais) e o
+// pedido vai para REVISAO.
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -414,6 +418,41 @@ function createBridgeRouter(db, whatsapp) {
         return res.status(status).json({ ok: false, error: `reserva recusada (${result.error})`, reason: result.error, existing: result.existing || null });
       }
       return res.json({ ok: true, reservationId: result.reservationId, dedupKey: result.dedupKey, expiresAt: result.expiresAt, ledger: result.record });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+  });
+
+  // FC Core v2.1.2 — registra um envio INCERTO no Core imediatamente (token da ponte).
+  // A extensão chama quando o clique no WhatsApp produziu um resultado
+  // desconhecido (timeout, erro, resposta ambígua): o Core marca o ledger como
+  // 'uncertain', INVALIDA a reserva (nunca mais pode ser confirmada nem renovada)
+  // e joga o pedido para REVISAO. Sem esta rota, uma reserva pendente expirada
+  // podia ser renovada mesmo depois de um clique incerto — a proteção só
+  // existia na trava local da extensão. Corpo: { reservationId, executorId,
+  // reason? }. Idempotente: chamar de novo com a mesma reserva devolve o
+  // registro existente (duplicate: true).
+  router.post('/api/sends/uncertain', requireBridge, (req, res) => {
+    const { reservationId, executorId, reason } = req.body || {};
+    if (!reservationId || typeof reservationId !== 'string' || !reservationId.trim()) {
+      return res.status(400).json({ ok: false, error: 'reservationId é obrigatório' });
+    }
+    if (!executorId || typeof executorId !== 'string' || !executorId.trim()) {
+      return res.status(400).json({ ok: false, error: 'executorId é obrigatório' });
+    }
+    try {
+      const result = ledger.markReservationUncertain(db, {
+        reservationId: reservationId.trim(),
+        executorId: executorId.trim(),
+        reason: reason ? String(reason).slice(0, 200) : null,
+      });
+      if (result.error) {
+        if (result.error === 'no_reservation') {
+          return res.status(404).json({ ok: false, error: 'reserva não encontrada', reason: 'no_reservation' });
+        }
+        return res.status(409).json({ ok: false, error: `envio incerto recusado (${result.error})`, reason: result.error });
+      }
+      return res.json({ ok: true, ledger: result.record, duplicate: result.duplicate });
     } catch (err) {
       return res.status(400).json({ ok: false, error: err.message });
     }

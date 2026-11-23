@@ -35,16 +35,16 @@ const config = {
   // Sem heartbeat dentro deste prazo, o /health mostra a extensão e a sessão
   // do WhatsApp como 'stale'/'unknown' — nunca como autenticada indefinidamente.
   heartbeatTtlSeconds: parseInt(process.env.HEARTBEAT_TTL_SECONDS || '120', 10),
-  version: '2.1.1',
+  version: '2.1.2',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };
 
 // Tabela de preços — México (MXN). Valores já usados nos atendimentos reais.
 const PRICES_MX = [
-  { quantity: 1, price: 75 },
-  { quantity: 2, price: 100 },
-  { quantity: 3, price: 139 },
+  { quantity: 1, price: 50 },
+  { quantity: 2, price: 89 },
+  { quantity: 3, price: 125 },
   { quantity: 5, price: 169 },
   { quantity: 10, price: 299 },
 ];

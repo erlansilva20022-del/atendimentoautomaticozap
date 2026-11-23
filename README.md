@@ -7,7 +7,7 @@ d'água primeiro**, aprova, paga — e só então recebe o **HD original sem mar
 Tudo roda **localmente no PC do dono** (Windows). Nada vai para nuvem pública,
 nenhuma foto de cliente é enviada para serviço externo sem autorização.
 
-## Arquitetura — FC Core v2.1.1 (um backend, uma extensão, um painel)
+## Arquitetura — FC Core v2.1.2 (um backend, uma extensão, um painel)
 
 ```
 WhatsApp Web (1 aba) ──┐
@@ -166,6 +166,28 @@ e sem provar que o executor detinha um lease válido. A v2.1.1 fecha isso:
   atualização coordenada com a extensão unificada, que ainda não está pronta.
   Reavaliar quando a extensão unificada estiver instalada.
 
+## O que mudou na v2.1.2 (envio incerto registrado no Core — fecha a brecha da v2.1.1)
+
+Na v2.1.1 a extensão já travava o reenvio localmente quando um clique no
+WhatsApp produzia um resultado desconhecido, mas o Core não tinha como saber:
+uma reserva `pending` expirada podia ser renovada mesmo depois de um clique
+incerto — a proteção existia só na extensão. A v2.1.2 fecha isso:
+
+- **`POST /api/sends/uncertain` (token da ponte):** a extensão registra o
+  `uncertain` IMEDIATAMENTE após um clique sem confirmação (timeout, erro,
+  resposta ambígua). Corpo: `{reservationId, executorId, reason?}`. O Core
+  marca o ledger como `uncertain`, joga o pedido para `REVISAO` e INVALIDA a
+  reserva (status `uncertain` + expiração imediata). Nenhum `confirm` nem
+  `renew` com aquele `reservationId` passa mais: `confirmReservedSend`
+  recusa registros `uncertain` e `reserveSend` recusa renovar uma chave
+  incerta. Reserva inexistente → 404; já confirmado → 409
+  (`already_confirmed`); executor diferente do que reservou → 409
+  (`executor_mismatch`). Chamar de novo com a mesma reserva é idempotente
+  (devolve o registro existente, `duplicate: true`). Fluxo da extensão:
+  `acquire lease` → `reserve` → clica no WhatsApp → se o resultado for
+  desconhecido, `POST /api/sends/uncertain {reservationId, executorId,
+  reason}` na hora (não espera a reserva expirar).
+
 ## O fluxo
 
 1. Cliente manda mensagem → saudação + tabela de preços (PT-BR ou ES-MX conforme o número).
@@ -243,6 +265,7 @@ pasta `session/` — não apague.
 | POST | `/api/leases/acquire` | extensão adquire o lease da conversa `{phone, executorId, ttlSeconds?}` (token da ponte) |
 | POST | `/api/leases/release` | extensão libera o lease `{phone, executorId}` (token da ponte) |
 | POST | `/api/sends/reserve` | **v2.1.1** — extensão reserva o envio antes de clicar no WhatsApp `{orderId, phone, action, imageKind, imageSha256, executorId, ttlSeconds?}` (token da ponte) — devolve `{reservationId, dedupKey, expiresAt}` |
+| POST | `/api/sends/uncertain` | **v2.1.2** — extensão registra o envio incerto no Core imediatamente após um clique sem confirmação `{reservationId, executorId, reason?}` (token da ponte) — ledger vira `uncertain`, reserva invalidada, pedido em REVISAO; idempotente |
 | POST | `/api/jobs` | admin — cria um trabalho na fila persistente `{orderId, step, kind, payload?, owner?, maxAttempts?, deadline?}` |
 | GET | `/api/jobs` | trabalhos da fila (`?status=` `?orderId=`) (autenticada) |
 | GET | `/api/jobs/:id` | um trabalho da fila (autenticada) |

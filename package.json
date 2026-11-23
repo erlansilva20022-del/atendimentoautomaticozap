@@ -6,7 +6,7 @@
     "sharp": "^0.33.5",
     "whatsapp-web.js": "^1.27.0"
   },
-  "description": "Sistema completo de atendimento via WhatsApp para retratos FC Artes Digitais: recebe fotos do cliente, gera retrato, envia prévia com marca d'água, só libera o HD original após aprovação e pagamento confirmado.",
+  "description": "Sistema completo de atendimento via WhatsApp para retratos FC Artes Digitais: recebe fotos do cliente, gera retrato, envia pr\u00e9via com marca d'\u00e1gua, s\u00f3 libera o HD original ap\u00f3s aprova\u00e7\u00e3o e pagamento confirmado.",
   "engines": {
     "node": ">=22"
   },
@@ -19,5 +19,5 @@
     "start": "node src/index.js"
   },
   "type": "commonjs",
-  "version": "2.1.1"
+  "version": "2.1.2"
 }

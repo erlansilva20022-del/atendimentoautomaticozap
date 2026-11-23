@@ -4,6 +4,12 @@
 // + whatsappMessageId dentro do TTL e com o lease ainda válido. Sem reserva não
 // há confirmação no fluxo automático — mark-preview-sent/mark-final-sent não
 // registram mais um envio confirmado "do nada".
+// FC Core v2.1.2 — envio incerto registrado no Core (POST /api/sends/uncertain):
+// quando o clique no WhatsApp produz um resultado desconhecido, a extensão
+// registra o 'uncertain' IMEDIATAMENTE no Core — antes só a extensão travava
+// o reenvio localmente, e uma reserva pendente expirada podia ser renovada.
+// A reserva incerta é invalidada no Core: nenhum confirm nem renew com aquele
+// reservationId passa mais (ver markReservationUncertain).
 //
 // Regras duras:
 // - Um envio é identificado por (pedido, ação, tipo de imagem, SHA-256 da imagem).
@@ -182,6 +188,42 @@ function confirmReservedSend(db, { reservationId, evidence, executorId = null })
   ).run(evidence.trim(), now, now, rec.dedup_key);
   dbMod.logEvent(db, rec.order_id, 'envio_confirmado',
     `${rec.action} key=${rec.dedup_key} evidencia=${evidence.trim()} reserva=${reservationId}`);
+  return { record: getLedgerByKey(db, rec.dedup_key), duplicate: false };
+}
+
+// FC Core v2.1.2 — registra um envio INCERTO no Core, com a reserva já feita.
+//
+// A extensão chama (POST /api/sends/uncertain) quando o clique no WhatsApp
+// produziu um resultado desconhecido (timeout, erro, resposta ambígua).
+// Retorna { record, duplicate } ou { error: 'no_reservation' |
+// 'already_confirmed' | 'executor_mismatch' }.
+//   - Reserva inexistente → 'no_reservation' (a rota vira 404).
+//   - Já confirmado → 'already_confirmed' (não dá para "desconfirmar" um envio).
+//   - Executor diferente do que reservou → 'executor_mismatch'.
+//   - Já incerto → devolve o registro existente, idempotente (duplicate: true).
+//   - Caso contrário: o ledger vira 'uncertain', o pedido vai para REVISAO e a
+//     reserva é INVALIDADA — status 'uncertain' + expires_at no passado. O
+//     reservationId continua no registro (auditoria + idempotência desta rota),
+//     mas está morto: confirmReservedSend recusa qualquer registro 'uncertain'
+//     e reserveSend recusa renovar uma chave incerta. Nenhum confirm nem renew
+//     com esse reservationId passa mais — a proteção agora existe no Core, não
+//     só na trava local da extensão.
+function markReservationUncertain(db, { reservationId, executorId = null, reason = null }) {
+  const rec = getReservationById(db, reservationId);
+  if (!rec) return { error: 'no_reservation' };
+  if (rec.status === 'confirmed') return { error: 'already_confirmed' };
+  if (executorId && rec.executor_id && rec.executor_id !== executorId) {
+    return { error: 'executor_mismatch' };
+  }
+  if (rec.status === 'uncertain') return { record: rec, duplicate: true };
+  if (rec.status !== 'pending') return { error: 'no_reservation' };
+  const detail = reason ? String(reason).slice(0, 200) : 'clique_sem_confirmacao';
+  markUncertain(db, rec.dedup_key, detail);
+  // Invalidação explícita da reserva: expiração imediata, além do status.
+  db.prepare("UPDATE send_ledger SET expires_at = ? WHERE dedup_key = ?")
+    .run(dbMod.nowIso(), rec.dedup_key);
+  dbMod.logEvent(db, rec.order_id, 'envio_incerto_reserva',
+    `${rec.action} key=${rec.dedup_key} reserva=${reservationId} motivo=${detail}`);
   return { record: getLedgerByKey(db, rec.dedup_key), duplicate: false };
 }
 
@@ -386,6 +428,7 @@ module.exports = {
   getReservationById,
   reserveSend,
   confirmReservedSend,
+  markReservationUncertain,
   listLedger,
   guardSend,
   cancelPending,
