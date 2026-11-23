@@ -1,4 +1,4 @@
-# FC Artes Digitais — Atendimento Automático de WhatsApp
+# FC Core — Atendimento Automático de WhatsApp
 
 Sistema completo de atendimento via WhatsApp Business para retratos de casal:
 o cliente envia as fotos originais, escolhe o estilo, recebe a **prévia com marca
@@ -6,6 +6,49 @@ d'água primeiro**, aprova, paga — e só então recebe o **HD original sem mar
 
 Tudo roda **localmente no PC do dono** (Windows). Nada vai para nuvem pública,
 nenhuma foto de cliente é enviada para serviço externo sem autorização.
+
+## Arquitetura — FC Core v2.0.0 (um backend, uma extensão, um painel)
+
+```
+WhatsApp Web (1 aba) ──┐
+                       ├─► FC Core 3008 (backend único: banco, arquivos, fila, segurança)
+Muse (1 aba) ──────────┘        ▲
+                                │  extensão única (captura + envio de prévia)
+                         Painel único: http://localhost:3008
+```
+
+- **Um backend:** FC Core na porta **3008** (banco SQLite, arquivos, fila,
+  registro de envios, lease de executor). A antiga **FC Bridge 3007** não é
+  mais um serviço ativo no fluxo: seu histórico é importado para a 3008
+  (ver "Importação do histórico da Bridge 3007" abaixo) e ela fica apenas
+  como compatibilidade, sem envios próprios.
+- **Uma extensão:** a extensão unificada do Chrome captura mensagens e fotos
+  e executa os envios autorizados. A extensão antiga fica instalada, porém
+  **desativada**, como reserva.
+- **Um painel:** http://localhost:3008 reúne pedidos, originais, prévias,
+  aprovações, pagamentos, erros, registro de envios e saúde do sistema.
+  O painel **não precisa ficar aberto** para a automação funcionar.
+- **O que continua separado:** a aba do WhatsApp Web e a aba do Muse são
+  aplicações independentes e continuam como duas abas distintas. Meta diária:
+  **2 abas** (WhatsApp + Muse), 3 com o painel.
+
+## O que foi consolidado na v2.0.0 (antes era gambiarra, agora é sistema)
+
+- **Registro de envios (anti-duplicação):** cada envio tem chave única por
+  (pedido, ação, tipo de imagem, SHA-256). Duplicata é recusada antes de
+  mandar; envio só é confirmado com evidência verificável (id da mensagem
+  no WhatsApp); resultado incerto joga o pedido para `REVISAO` sem reenvio
+  automático. Ver no painel: seção "Envios recentes" e detalhe do pedido.
+- **Lease de executor único:** só uma instância da extensão detém o envio de
+  uma conversa por vez (com expiração). Outra instância é recusada com 409.
+- **Importação do histórico da Bridge 3007:** registros antigos entram como
+  histórico, nunca sobrescrevem o progresso da 3008 e nunca criam segundo
+  pedido para o mesmo UUID; fotos só entram com SHA-256 conferido antes e
+  depois da cópia; conflitos vão para revisão manual.
+- **Saúde e fila:** `/health` mostra versão, banco, profundidade da fila,
+  leases ativos, estado do envio automático e contagem por status.
+- **Início automático:** ver `docs/autostart-windows.md` (Agendador de
+  Tarefas ou NSSM, logs e backup completo dos dois bancos com WAL).
 
 ## O fluxo
 
@@ -75,18 +118,47 @@ pasta `session/` — não apague.
 
 | Método | Rota | Para quê |
 |---|---|---|
-| GET | `/health` | versão, `frontdeskMode: "muse"`, status do banco |
-| GET | `/` | dashboard (lista pedidos, botões de ação) |
+| GET | `/health` | versão, `frontdeskMode: "muse"`, banco, fila, leases, envio automático, contagem por status |
+| GET | `/` | painel de operações (pedidos, detalhe, envios, erros, importação) |
 | GET | `/api/orders` | lista de pedidos |
-| GET | `/api/orders/:id` | status, fotos e eventos do pedido |
+| GET | `/api/orders/:id` | status, fotos, eventos e registro de envios do pedido |
+| GET | `/api/ledger` | registro de envios (`?orderId=` filtra por pedido) |
+| GET | `/api/leases/:phone` | lease ativo da conversa (se houver) |
+| POST | `/api/leases/acquire` | extensão adquire o lease da conversa `{phone, executorId, ttlSeconds?}` (token da ponte) |
+| POST | `/api/leases/release` | extensão libera o lease `{phone, executorId}` (token da ponte) |
 | POST | `/api/muse/orders` | handoff do Muse: cria/recupera pedido por `{phone, observedClock, text}` (sem messageId nativo — fingerprint telefone+hora+texto) |
 | POST | `/api/muse/order-result` | handoff do Muse: recebe a imagem gerada `{orderId, phone, source:"MUSE", sourceSha256, image}` (dataUrl ou base64); confere o SHA-256 e salva o original |
+| GET | `/api/orders/:id/preview-file` | baixa a prévia com marca (token da ponte) |
+| POST | `/api/orders/:id/mark-preview-sent` | extensão confirma o envio da prévia com evidência `{whatsappMessageId, executorId?}` (token da ponte) |
+| POST | `/api/orders/:id/mark-final-sent` | extensão confirma o envio do HD com evidência (token da ponte) |
 | POST | `/api/orders/:id/confirm-payment` | admin — confirma pagamento |
-| POST | `/api/orders/:id/send-preview` | admin — envia a prévia com marca |
-| POST | `/api/orders/:id/send-final` | admin — envia o HD (só após pagamento confirmado) |
+| POST | `/api/orders/:id/send-preview` | admin — envia a prévia com marca (trava anti-duplicação + lease) |
+| POST | `/api/orders/:id/send-final` | admin — envia o HD (só após pagamento confirmado; trava anti-duplicação + lease) |
+| POST | `/api/admin/import-bridge3007` | admin — importa o histórico da Bridge 3007 a partir de um JSON exportado |
+| GET | `/api/admin/import-conflicts` | admin — conflitos da importação, para revisão manual |
 
 Rotas de admin exigem o header `x-admin-token: <ADMIN_TOKEN>`.
-Todas as rotas têm anti-duplicação por pedido + SHA-256.
+Rotas da ponte exigem o header `x-bridge-token: <BRIDGE_TOKEN>` quando ele está
+configurado. Todas as rotas têm anti-duplicação por pedido + SHA-256, e os
+envios passam pelo registro de envios: duplicata, envio em andamento, envio
+incerto anterior ou lease de outro executor recusam o envio antes de mandar.
+
+## Importação do histórico da Bridge 3007
+
+A Bridge 3007 tem banco e máquina de estados próprios — a migração não copia
+o arquivo do banco. Exporte os pedidos antigos para JSON (formato em
+`src/migrate3007.js`) e importe pelo painel (seção "Importar histórico") ou
+pelo script:
+
+```bat
+set ADMIN_TOKEN=seu-token
+node scripts\import-bridge3007.js C:\caminho\bridge3007-export.json
+```
+
+Regras da importação: UUID que já existe na 3008 vira **conflito** (nunca
+sobrescreve, nunca duplica); fotos só entram com arquivo real e SHA-256
+conferido antes e depois da cópia; eventos antigos entram com o prefixo
+`3007:`. Conflitos aparecem no painel, em "Erros e revisão".
 
 ## Pasta do Muse
 

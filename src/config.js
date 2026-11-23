@@ -21,7 +21,9 @@ const config = {
   // Respostas automáticas no WhatsApp: DESLIGADO por padrão enquanto o Muse é o atendente
   // principal — ligar (AUTO_REPLY_ENABLED=true) só quando este sistema assumir o atendimento.
   autoReplyEnabled: process.env.AUTO_REPLY_ENABLED === 'true',
-  version: '1.2.0',
+  // FC Core v2.0.0 — lease de executor único (TTL em segundos; padrão 120s).
+  leaseTtlSeconds: parseInt(process.env.LEASE_TTL_SECONDS || '120', 10),
+  version: '2.0.0',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };

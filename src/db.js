@@ -69,6 +69,53 @@ function initDb(dbPath = config.databasePath) {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_events_order ON events(order_id);
+
+    -- FC Core v2.0.0 — registro de envios (anti-duplicação).
+    -- Chave única por (pedido, ação, tipo de imagem, hash da imagem): o mesmo
+    -- envio nunca é repetido. Um envio só vira 'confirmed' com evidência
+    -- verificável (confirmação explícita da extensão). Resultado incerto vira
+    -- 'uncertain' e o pedido vai para REVISAO, sem reenvio automático.
+    CREATE TABLE IF NOT EXISTS send_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedup_key TEXT NOT NULL UNIQUE,
+      order_id TEXT NOT NULL REFERENCES orders(id),
+      phone TEXT NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('preview', 'final')),
+      image_kind TEXT NOT NULL,
+      image_path TEXT NOT NULL,
+      image_sha256 TEXT NOT NULL,
+      image_bytes INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed', 'uncertain', 'refused_duplicate')),
+      executor_id TEXT,
+      evidence TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      confirmed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ledger_order ON send_ledger(order_id);
+    CREATE INDEX IF NOT EXISTS idx_ledger_status ON send_ledger(status);
+
+    -- FC Core v2.0.0 — lease de executor único: só uma instância da extensão
+    -- detém o envio de uma conversa por vez. O lease expira (TTL) e pode ser
+    -- renovado pelo mesmo executor; outro executor não pode tomar a conversa.
+    CREATE TABLE IF NOT EXISTS send_leases (
+      phone TEXT PRIMARY KEY,
+      executor_id TEXT NOT NULL,
+      acquired_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
+    -- FC Core v2.0.0 — conflitos da importação do histórico da FC Bridge 3007,
+    -- para revisão manual do dono (nunca sobrescrevem o progresso da 3008).
+    CREATE TABLE IF NOT EXISTS import_conflicts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source TEXT NOT NULL DEFAULT 'bridge3007',
+      order_id TEXT,
+      reason TEXT NOT NULL,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflicts_order ON import_conflicts(order_id);
   `);
   return db;
 }

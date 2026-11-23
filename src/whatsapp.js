@@ -9,6 +9,7 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
 const dbMod = require('./db');
+const ledger = require('./sendLedger');
 const { OrderService, isDoneWord } = require('./orders');
 const { t } = require('./messages');
 const { config } = require('./config');
@@ -23,24 +24,46 @@ function isBlockedChat(chat) {
   return chat && chat.isReadOnly === true;
 }
 
-async function sendPreview(orderId) {
+async function sendPreview(orderId, opts = {}) {
   if (!client) throw new Error('WhatsApp não conectado — verifique WHATSAPP_ENABLED e o QR Code');
   const order = dbMod.getOrder(db, orderId);
   if (!order) throw new Error(`Pedido não encontrado: ${orderId}`);
   const previews = dbMod.listPhotos(db, orderId, 'preview');
   if (previews.length === 0) throw new Error('prévia ainda não gerada');
   const preview = previews[previews.length - 1]; // a mais recente
+  // FC Core v2.0.0 — trava de envio: duplicata, envio em andamento, envio
+  // incerto anterior ou lease de outro executor recusam o envio ANTES de mandar.
+  const executorId = opts.executorId || null;
+  const guard = ledger.guardSend(db, {
+    orderId, phone: order.phone, action: 'preview', imageKind: 'preview',
+    imageSha256: preview.sha256, imagePath: preview.path, imageBytes: preview.bytes, executorId,
+  });
+  if (!guard.allowed) {
+    throw new Error(`envio recusado (${guard.reason}) — registro existente, sem reenvio`);
+  }
   const chat = await client.getChatById(`${order.phone}@c.us`);
   if (isBlockedChat(chat)) throw new Error('conversa bloqueada — não enviar sem autorização do dono');
   const media = MessageMedia.fromFilePath(preview.path);
-  const sent = await chat.sendMessage(media, { caption: t(order.language, 'previewCaption') });
-  if (!sent || !sent.id) throw new Error('envio da prévia não confirmado pelo WhatsApp');
+  let sent;
+  try {
+    sent = await chat.sendMessage(media, { caption: t(order.language, 'previewCaption') });
+  } catch (err) {
+    // Resultado incerto: registra e joga o pedido para REVISAO. Sem reenvio automático.
+    ledger.markUncertain(db, guard.key, err.message);
+    throw new Error(`envio incerto — pedido em REVISAO: ${err.message}`);
+  }
+  if (!sent || !sent.id) {
+    ledger.markUncertain(db, guard.key, 'sem confirmação do WhatsApp');
+    throw new Error('envio da prévia não confirmado pelo WhatsApp — pedido em REVISAO');
+  }
+  const evidence = sent.id._serialized || sent.id.id || 'whatsapp';
+  ledger.confirmSend(db, guard.key, evidence);
   service.markPreviewSent(orderId);
-  dbMod.logEvent(db, orderId, 'previa_enviada', `msg=${sent.id._serialized || sent.id.id || '?'}`);
+  dbMod.logEvent(db, orderId, 'previa_enviada', `msg=${evidence}`);
   return sent;
 }
 
-async function sendFinal(orderId) {
+async function sendFinal(orderId, opts = {}) {
   if (!client) throw new Error('WhatsApp não conectado — verifique WHATSAPP_ENABLED e o QR Code');
   const order = dbMod.getOrder(db, orderId);
   if (!order) throw new Error(`Pedido não encontrado: ${orderId}`);
@@ -49,14 +72,33 @@ async function sendFinal(orderId) {
   }
   const finals = dbMod.listPhotos(db, orderId, 'final');
   if (finals.length === 0) throw new Error('arquivo final não encontrado');
+  // FC Core v2.0.0 — trava de envio (mesma regra da prévia), com a versão do
+  // conjunto de arquivos finais como identificador da imagem.
+  const executorId = opts.executorId || null;
+  const versionHash = ledger.versionHashForPhotos(finals);
+  const guard = ledger.guardSend(db, {
+    orderId, phone: order.phone, action: 'final', imageKind: 'final',
+    imageSha256: versionHash, imagePath: finals[0].path, imageBytes: finals.reduce((s, f) => s + f.bytes, 0), executorId,
+  });
+  if (!guard.allowed) {
+    throw new Error(`envio recusado (${guard.reason}) — registro existente, sem reenvio`);
+  }
   const chat = await client.getChatById(`${order.phone}@c.us`);
   if (isBlockedChat(chat)) throw new Error('conversa bloqueada — não enviar sem autorização do dono');
-  for (const file of finals) {
-    const media = MessageMedia.fromFilePath(file.path);
-    const sent = await chat.sendMessage(media);
-    if (!sent || !sent.id) throw new Error('envio do arquivo final não confirmado pelo WhatsApp');
+  let evidence = 'whatsapp';
+  try {
+    for (const file of finals) {
+      const media = MessageMedia.fromFilePath(file.path);
+      const sent = await chat.sendMessage(media);
+      if (!sent || !sent.id) throw new Error('envio do arquivo final não confirmado pelo WhatsApp');
+      evidence = sent.id._serialized || sent.id.id || evidence;
+    }
+    await chat.sendMessage(t(order.language, 'finalDelivery'));
+  } catch (err) {
+    ledger.markUncertain(db, guard.key, err.message);
+    throw new Error(`envio incerto — pedido em REVISAO: ${err.message}`);
   }
-  await chat.sendMessage(t(order.language, 'finalDelivery'));
+  ledger.confirmSend(db, guard.key, evidence);
   service.markFinalDelivered(orderId);
   return true;
 }
