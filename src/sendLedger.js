@@ -35,9 +35,16 @@ function listLedger(db, orderId = null, limit = 100) {
 // Guarda de envio: verifica duplicata e lease ANTES de qualquer envio.
 // Retorna { allowed, reason?, record?, existing?, lease? }.
 // - 'duplicate': já confirmado com essa chave — não enviar de novo.
-// - 'in_progress': outro executor já está enviando essa chave.
+// - 'in_progress': outro envio desta chave está em andamento.
 // - 'uncertain': envio anterior incerto — pedido em REVISAO, sem reenvio.
 // - 'lease': outra instância detém a conversa.
+// - 'no_lease': o executor não detém um lease válido para esta conversa.
+//   FC Core v2.1.0 (brecha b): envio automático (com executorId) EXIGE um
+//   lease válido detido por aquele executor — não basta "não haver outro lease".
+//   Envio manual do dono (sem executorId) continua sem passar pelo lease.
+// - Retomar um envio 'pending' (brecha c): só o MESMO executor, com um lease
+//   válido recém-adquirido e revalidando telefone/arquivo/hash. Qualquer outra
+//   tentativa é recusada — nunca retomar no escuro.
 function guardSend(db, { orderId, phone, action, imageKind, imageSha256, imagePath, imageBytes, executorId = null }) {
   const key = dedupKey(orderId, action, imageKind, imageSha256);
   const existing = getLedgerByKey(db, key);
@@ -49,20 +56,25 @@ function guardSend(db, { orderId, phone, action, imageKind, imageSha256, imagePa
       return { allowed: false, reason: 'uncertain', key, existing };
     }
     if (existing.status === 'pending') {
-      // O mesmo chamador retomando o próprio envio em andamento: pode prosseguir.
-      // Vale para o mesmo executorId ou para dois chamados sem executor (dono).
-      if ((executorId && existing.executor_id === executorId) || (!executorId && !existing.executor_id)) {
-        return { allowed: true, ownPending: true, key, record: existing };
+      // Retomada: só o mesmo executor, com lease válido, revalidando tudo.
+      const lease = executorId ? getLease(db, phone) : null;
+      const sameExecutor = executorId && existing.executor_id === executorId;
+      const leaseOk = lease && lease.executor_id === executorId;
+      const revalidated =
+        phone === existing.phone &&
+        imageSha256 === existing.image_sha256 &&
+        imagePath === existing.image_path;
+      if (sameExecutor && leaseOk && revalidated) {
+        return { allowed: true, ownPending: true, resumed: true, key, record: existing };
       }
       return { allowed: false, reason: 'in_progress', key, existing };
     }
   }
-  // Lease: só vale quando o chamador se identifica como executor (extensão).
-  // Envio manual do dono (sem executorId) não passa pelo lease.
+  // Lease obrigatório para envio automático (com executorId).
   if (executorId) {
     const lease = getLease(db, phone);
-    if (lease && lease.executor_id !== executorId) {
-      return { allowed: false, reason: 'lease', key, lease };
+    if (!lease || lease.executor_id !== executorId) {
+      return { allowed: false, reason: 'no_lease', key, lease: lease || null };
     }
   }
   const now = dbMod.nowIso();
@@ -76,7 +88,11 @@ function guardSend(db, { orderId, phone, action, imageKind, imageSha256, imagePa
     // Corrida: outro processo registrou a mesma chave entre a leitura e a inserção.
     if (String(err.message).includes('UNIQUE')) {
       const raced = getLedgerByKey(db, key);
-      return { allowed: false, reason: raced && raced.status === 'confirmed' ? 'duplicate' : 'in_progress', key, existing: raced };
+      const reason = !raced ? 'in_progress'
+        : raced.status === 'confirmed' ? 'duplicate'
+        : raced.status === 'uncertain' ? 'uncertain'
+        : 'in_progress';
+      return { allowed: false, reason, key, existing: raced };
     }
     throw err;
   }
@@ -93,9 +109,14 @@ function cancelPending(db, key) {
 }
 
 // Confirma um envio com evidência verificável (ex.: id da mensagem no WhatsApp).
-// Idempotente: confirmar de novo com a mesma evidência não duplica nada nem
-// registra o evento duas vezes.
+// FC Core v2.1.0 (brecha a): a confirmação no fluxo automático EXIGE um
+// whatsappMessageId — sem evidência, a confirmação é recusada. Idempotente:
+// confirmar de novo com a mesma evidência não duplica nada nem registra o
+// evento duas vezes.
 function confirmSend(db, key, evidence) {
+  if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
+    throw new Error('evidência whatsappMessageId é obrigatória para confirmar o envio');
+  }
   const rec = getLedgerByKey(db, key);
   if (!rec) return null;
   if (rec.status === 'confirmed' && rec.evidence === evidence) return rec;
@@ -107,10 +128,45 @@ function confirmSend(db, key, evidence) {
   return getLedgerByKey(db, key);
 }
 
+// Confirmação manual do dono (override, SÓ via rota de admin): registra o envio
+// sem whatsappMessageId, mas deixa registrado QUEM confirmou e POR QUÊ.
+// Nunca é usada pelo fluxo automático — só por decisão explícita do dono,
+// com o motivo registrado em evento e no ledger (evidence = 'override:<motivo>').
+function confirmSendOverride(db, { orderId, phone, action, imageKind, imagePath, imageSha256, imageBytes, executorId = null, overriddenBy, reason }) {
+  if (!overriddenBy || !reason) {
+    throw new Error('override exige overriddenBy e reason');
+  }
+  const evidence = `override:${String(reason).slice(0, 200)}`;
+  const key = dedupKey(orderId, action, imageKind, imageSha256);
+  const existing = getLedgerByKey(db, key);
+  const now = dbMod.nowIso();
+  if (existing && existing.status === 'confirmed') {
+    return { record: existing, duplicate: true };
+  }
+  if (existing) {
+    db.prepare(
+      "UPDATE send_ledger SET status = 'confirmed', evidence = ?, confirmed_at = ?, updated_at = ? WHERE dedup_key = ?"
+    ).run(evidence, now, now, key);
+  } else {
+    db.prepare(
+      `INSERT INTO send_ledger (dedup_key, order_id, phone, action, image_kind, image_path,
+        image_sha256, image_bytes, status, executor_id, evidence, created_at, updated_at, confirmed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?)`
+    ).run(key, orderId, phone, action, imageKind, imagePath, imageSha256, imageBytes, executorId, evidence, now, now, now);
+  }
+  dbMod.logEvent(db, orderId, 'envio_confirmado_override',
+    `${action} key=${key} por=${overriddenBy} motivo=${String(reason).slice(0, 200)}`);
+  return { record: getLedgerByKey(db, key), duplicate: false };
+}
+
 // Registra um envio confirmado que chegou por confirmação explícita da extensão,
 // mesmo sem um registro 'pending' anterior (ex.: a extensão enviou e só depois
 // confirmou). Cria o registro já como 'confirmed' a partir da foto registrada.
+// FC Core v2.1.0: exige evidência (whatsappMessageId) — sem ela, recusa.
 function confirmSendForPhoto(db, { orderId, phone, action, imageKind, imagePath, imageSha256, imageBytes, executorId = null, evidence }) {
+  if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
+    throw new Error('evidência whatsappMessageId é obrigatória para confirmar o envio');
+  }
   const key = dedupKey(orderId, action, imageKind, imageSha256);
   const existing = getLedgerByKey(db, key);
   const now = dbMod.nowIso();
@@ -199,6 +255,7 @@ module.exports = {
   cancelPending,
   confirmSend,
   confirmSendForPhoto,
+  confirmSendOverride,
   markUncertain,
   getLease,
   listActiveLeases,

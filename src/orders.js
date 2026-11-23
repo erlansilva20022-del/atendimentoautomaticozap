@@ -8,6 +8,7 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 const dbMod = require('./db');
 const ledger = require('./sendLedger');
+const jobsMod = require('./jobs');
 const { sha256Buffer } = require('./hash');
 const { APPROVAL_PHRASES, ADJUSTMENT_MARKERS, priceFor, config, originalsDir } = require('./config');
 const { generatePortrait } = require('./generate');
@@ -187,6 +188,7 @@ class OrderService {
       photos: dbMod.listPhotos(this.db, orderId),
       events: dbMod.listEvents(this.db, orderId),
       sendLedger: ledger.listLedger(this.db, orderId),
+      jobs: jobsMod.listJobs(this.db, { orderId, limit: 50 }),
     };
   }
 }

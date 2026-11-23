@@ -22,10 +22,15 @@ async function loadHealth() {
     $('health').innerHTML = `
       <span class="stat"><b>v${esc(d.version)}</b>versão</span>
       <span class="stat"><b>${esc(d.db)}</b>banco</span>
-      <span class="stat"><b>${d.queueDepth ?? '—'}</b>fila</span>
+      <span class="stat"><b>${d.queueDepth ?? '—'}</b>fila (trabalhos pendentes)</span>
       <span class="stat"><b>${d.leases ? d.leases.active : '—'}</b>leases ativos</span>
-      <span class="stat"><b>${d.autoSend ? 'LIGADO' : 'desligado'}</b>envio automático</span>
-      <span class="stat"><b>${esc(d.frontdeskMode)}</b>modo</span>`;
+      <span class="stat"><b>${d.autoSend ? 'LIGADO' : 'desligado'}</b>envio automático (Core)</span>
+      <span class="stat"><b>${esc(d.frontdeskMode)}</b>modo</span>
+      <span class="stat"><b>${d.disk && d.disk.freeGb !== null ? d.disk.freeGb + ' GB' : '—'}</b>disco livre${d.disk && d.disk.low ? ' ⚠ BAIXO' : ''}</span>
+      <span class="stat"><b>${d.sends ? `${d.sends.confirmed} ✓ / ${d.sends.uncertain} ? / ${d.sends.refused_duplicate} ✕` : '—'}</b>envios (confirmados/incertos/bloqueados)</span>
+      <span class="stat"><b>${d.sendState && d.sendState.extension ? d.sendState.extension.state : '—'}</b>extensão</span>
+      <span class="stat"><b>${d.sendState && d.sendState.whatsappSession ? d.sendState.whatsappSession.state : '—'}</b>sessão WhatsApp</span>
+      <span class="stat"><b>${d.lastBackupAt ? esc(d.lastBackupAt.slice(0, 10)) : 'nunca registrado'}</b>último backup</span>`;
     const counts = d.countsByStatus || {};
     $('counts').innerHTML = Object.keys(counts).length
       ? Object.entries(counts).map(([s, n]) => `<span class="stat"><b>${n}</b>${esc(s)}</span>`).join('')
@@ -35,11 +40,22 @@ async function loadHealth() {
   }
 }
 
+function authHeaders() {
+  const h = {};
+  if (token()) h['x-admin-token'] = token();
+  else if (bridgeToken()) h['x-bridge-token'] = bridgeToken();
+  return h;
+}
+
 async function loadOrders() {
   const tbody = $('orders');
   try {
-    const res = await fetch('/api/orders');
+    const res = await fetch('/api/orders', { headers: authHeaders() });
     const data = await res.json();
+    if (res.status === 401) {
+      tbody.innerHTML = '<tr><td colspan="8">Informe o token de admin (ou da ponte) para ver os pedidos.</td></tr>';
+      return;
+    }
     if (!data.ok || !data.orders.length) {
       tbody.innerHTML = '<tr><td colspan="8">Nenhum pedido ainda.</td></tr>';
       $('errors').innerHTML = '<tr><td colspan="4">Nenhum pedido em revisão.</td></tr>';
@@ -72,7 +88,7 @@ async function loadOrders() {
 
 async function loadLedger() {
   try {
-    const res = await fetch('/api/ledger?limit=30');
+    const res = await fetch('/api/ledger?limit=30', { headers: authHeaders() });
     const data = await res.json();
     const tbody = $('ledger');
     if (!data.ok || !data.ledger.length) {
@@ -108,7 +124,7 @@ async function loadConflicts() {
 
 async function loadDetail(id) {
   try {
-    const res = await fetch(`/api/orders/${id}`);
+    const res = await fetch(`/api/orders/${id}`, { headers: authHeaders() });
     const data = await res.json();
     if (!data.ok) { showMsg(`Erro: ${data.error}`); return; }
     const o = data.order;
@@ -124,6 +140,9 @@ async function loadDetail(id) {
     $('detailLedger').innerHTML = (o.sendLedger || []).length
       ? o.sendLedger.map((l) => `<tr><td>${esc(l.action)}</td><td class="mono">${esc(l.image_sha256.slice(0, 12))}…</td><td><span class="badge ${esc(l.status)}">${esc(l.status)}</span></td><td>${esc(l.executor_id || '—')}</td><td class="mono">${esc(l.evidence || '—')}</td><td>${esc(l.created_at)}</td></tr>`).join('')
       : '<tr><td colspan="6">Nenhum envio registrado.</td></tr>';
+    $('detailJobs').innerHTML = (o.jobs || []).length
+      ? o.jobs.map((j) => `<tr><td>${esc(j.step)}</td><td>${esc(j.kind)}</td><td><span class="badge ${esc(j.status)}">${esc(j.status)}</span></td><td>${j.attempts}/${j.max_attempts}</td><td>${esc(j.failure_reason || j.result || '—')}</td><td>${esc(j.created_at)}</td></tr>`).join('')
+      : '<tr><td colspan="6">Nenhum trabalho na fila para este pedido.</td></tr>';
     $('detailEvents').textContent = (o.events || []).map((e) => `${e.created_at}  ${e.type}  ${e.detail || ''}`).join('\n') || 'Sem eventos.';
     $('detailSection').scrollIntoView({ behavior: 'smooth' });
   } catch (err) {
@@ -147,6 +166,30 @@ async function callAction(action, id) {
     refreshAll();
   } catch (err) {
     showMsg(`Erro de rede: ${err.message}`);
+  }
+}
+
+async function loadJobs() {
+  if (!token()) { $('jobs').innerHTML = '<tr><td colspan="6">Informe o token de admin para ver a fila.</td></tr>'; return; }
+  try {
+    const res = await fetch('/api/jobs?limit=30', { headers: authHeaders() });
+    const data = await res.json();
+    const tbody = $('jobs');
+    if (!data.ok || !data.jobs.length) {
+      tbody.innerHTML = '<tr><td colspan="6">Nenhum trabalho na fila.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.jobs.map((j) => `
+      <tr>
+        <td title="${esc(j.order_id || '')}">${esc((j.order_id || '—').slice(0, 8))}</td>
+        <td>${esc(j.step)}</td>
+        <td>${esc(j.kind)}</td>
+        <td><span class="badge ${esc(j.status)}">${esc(j.status)}</span></td>
+        <td>${j.attempts}/${j.max_attempts}</td>
+        <td>${esc(j.failure_reason || j.result || '—')}</td>
+      </tr>`).join('');
+  } catch {
+    $('jobs').innerHTML = '<tr><td colspan="6">Erro ao carregar trabalhos.</td></tr>';
   }
 }
 
@@ -182,6 +225,7 @@ function refreshAll() {
   loadHealth();
   loadOrders();
   loadLedger();
+  loadJobs();
   loadConflicts();
 }
 

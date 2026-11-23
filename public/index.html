@@ -73,6 +73,17 @@
     <table><thead><tr><th>Ação</th><th>Imagem</th><th>Status</th><th>Executor</th><th>Evidência</th><th>Quando</th></tr></thead><tbody id="detailLedger"></tbody></table>
     <h3>Eventos</h3>
     <pre id="detailEvents"></pre>
+    <h3>Trabalhos da fila</h3>
+    <table><thead><tr><th>Etapa</th><th>Tipo</th><th>Status</th><th>Tentativas</th><th>Resultado / falha</th><th>Criado</th></tr></thead><tbody id="detailJobs"></tbody></table>
+  </section>
+
+  <section>
+    <h2>Fila de trabalhos (persistente)</h2>
+    <p class="muted">Trabalhos duráveis: sobrevivem a reinício do processo. Envios de foto nunca repetem automaticamente — falha vira <b>needs_review</b> e o pedido vai para REVISAO.</p>
+    <table>
+      <thead><tr><th>Pedido</th><th>Etapa</th><th>Tipo</th><th>Status</th><th>Tentativas</th><th>Resultado / falha</th></tr></thead>
+      <tbody id="jobs"><tr><td colspan="6">Carregando…</td></tr></tbody>
+    </table>
   </section>
 
   <section>

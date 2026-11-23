@@ -31,13 +31,17 @@ async function sendPreview(orderId, opts = {}) {
   const previews = dbMod.listPhotos(db, orderId, 'preview');
   if (previews.length === 0) throw new Error('prévia ainda não gerada');
   const preview = previews[previews.length - 1]; // a mais recente
-  // FC Core v2.0.0 — trava de envio: duplicata, envio em andamento, envio
-  // incerto anterior ou lease de outro executor recusam o envio ANTES de mandar.
+  // FC Core v2.1.0 — trava de envio: duplicata, envio em andamento, envio
+  // incerto anterior ou lease inválido/ausente recusam o envio ANTES de mandar.
+  // Quando quem chama já passou pela trava (rota admin, worker de jobs), ele
+  // passa guardKey e a trava NÃO é verificada duas vezes.
   const executorId = opts.executorId || null;
-  const guard = ledger.guardSend(db, {
-    orderId, phone: order.phone, action: 'preview', imageKind: 'preview',
-    imageSha256: preview.sha256, imagePath: preview.path, imageBytes: preview.bytes, executorId,
-  });
+  const guard = opts.guardKey
+    ? { allowed: true, key: opts.guardKey }
+    : ledger.guardSend(db, {
+        orderId, phone: order.phone, action: 'preview', imageKind: 'preview',
+        imageSha256: preview.sha256, imagePath: preview.path, imageBytes: preview.bytes, executorId,
+      });
   if (!guard.allowed) {
     throw new Error(`envio recusado (${guard.reason}) — registro existente, sem reenvio`);
   }
@@ -72,20 +76,23 @@ async function sendFinal(orderId, opts = {}) {
   }
   const finals = dbMod.listPhotos(db, orderId, 'final');
   if (finals.length === 0) throw new Error('arquivo final não encontrado');
-  // FC Core v2.0.0 — trava de envio (mesma regra da prévia), com a versão do
-  // conjunto de arquivos finais como identificador da imagem.
+  // FC Core v2.1.0 — trava de envio (mesma regra da prévia), com a versão do
+  // conjunto de arquivos finais como identificador da imagem. Quem já passou
+  // pela trava passa guardKey e ela não é verificada duas vezes.
   const executorId = opts.executorId || null;
   const versionHash = ledger.versionHashForPhotos(finals);
-  const guard = ledger.guardSend(db, {
-    orderId, phone: order.phone, action: 'final', imageKind: 'final',
-    imageSha256: versionHash, imagePath: finals[0].path, imageBytes: finals.reduce((s, f) => s + f.bytes, 0), executorId,
-  });
+  const guard = opts.guardKey
+    ? { allowed: true, key: opts.guardKey }
+    : ledger.guardSend(db, {
+        orderId, phone: order.phone, action: 'final', imageKind: 'final',
+        imageSha256: versionHash, imagePath: finals[0].path, imageBytes: finals.reduce((s, f) => s + f.bytes, 0), executorId,
+      });
   if (!guard.allowed) {
     throw new Error(`envio recusado (${guard.reason}) — registro existente, sem reenvio`);
   }
   const chat = await client.getChatById(`${order.phone}@c.us`);
   if (isBlockedChat(chat)) throw new Error('conversa bloqueada — não enviar sem autorização do dono');
-  let evidence = 'whatsapp';
+  let evidence = null;
   try {
     for (const file of finals) {
       const media = MessageMedia.fromFilePath(file.path);
@@ -98,9 +105,13 @@ async function sendFinal(orderId, opts = {}) {
     ledger.markUncertain(db, guard.key, err.message);
     throw new Error(`envio incerto — pedido em REVISAO: ${err.message}`);
   }
+  if (!evidence) {
+    ledger.markUncertain(db, guard.key, 'sem confirmação do WhatsApp');
+    throw new Error('envio do HD não confirmado pelo WhatsApp — pedido em REVISAO');
+  }
   ledger.confirmSend(db, guard.key, evidence);
   service.markFinalDelivered(orderId);
-  return true;
+  return evidence; // id da mensagem do WhatsApp — evidência verificável do envio
 }
 
 async function handleTextMessage(msg, order) {

@@ -116,6 +116,74 @@ function initDb(dbPath = config.databasePath) {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_conflicts_order ON import_conflicts(order_id);
+
+    -- FC Core v2.1.0 — fila persistente de trabalhos (durable job queue).
+    -- Um trabalho sobrevive à queda do processo: nada fica só em memória.
+    -- kind define a política de retry: envios de foto (send_preview/send_final)
+    -- NUNCA repetem automaticamente — falha vira 'needs_review' e o pedido vai
+    -- para REVISAO. Leituras/downloads/verificações tentam até max_attempts
+    -- com espera crescente (backoff) antes de falhar.
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      order_id TEXT REFERENCES orders(id),
+      step TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      next_attempt_at TEXT,
+      deadline TEXT,
+      owner TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in_progress', 'done', 'failed', 'needs_review')),
+      result TEXT,
+      failure_reason TEXT,
+      correlation_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, next_attempt_at);
+    CREATE INDEX IF NOT EXISTS idx_jobs_order ON jobs(order_id);
+
+    -- FC Core v2.1.0 — reconciliação de envios históricos (anteriores à v2.0.0).
+    -- Registra no ledger envios já confirmados no passado, SEM reenviar arquivos
+    -- e SEM mudar o estado do pedido. Sem evidência suficiente, a entrada fica
+    -- como 'review' (só revisão manual) e NÃO entra no ledger como confirmada.
+    CREATE TABLE IF NOT EXISTS reconciliation_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      action TEXT NOT NULL CHECK (action IN ('preview', 'final')),
+      image_kind TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      whatsapp_message_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('confirmed', 'review', 'skipped')),
+      reason TEXT,
+      ledger_dedup_key TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recon_order ON reconciliation_entries(order_id);
+
+    -- FC Core v2.1.0 — arquivos da pasta muse-inbox já processados (persistente).
+    -- Substitui a lista em memória do vigia: um arquivo já importado/ignorado
+    -- nunca é reprocessado nem recontado na fila, mesmo após reiniciar o processo.
+    CREATE TABLE IF NOT EXISTS processed_inbox_files (
+      filename TEXT PRIMARY KEY,
+      sha256 TEXT,
+      order_id TEXT,
+      status TEXT NOT NULL CHECK (status IN ('imported', 'ignored', 'duplicate')),
+      reason TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_sha ON processed_inbox_files(sha256);
+
+    -- FC Core v2.1.0 — metadados do sistema (chave/valor): último backup, último
+    -- heartbeat da extensão, estado da sessão do WhatsApp, etc.
+    CREATE TABLE IF NOT EXISTS system_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
   return db;
 }
@@ -236,6 +304,39 @@ function listEvents(db, orderId) {
   return db.prepare('SELECT * FROM events WHERE order_id = ? ORDER BY created_at').all(orderId);
 }
 
+// --- FC Core v2.1.0 — metadados do sistema (chave/valor) ---
+
+function getMeta(db, key) {
+  const row = db.prepare('SELECT value FROM system_meta WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+function setMeta(db, key, value) {
+  db.prepare(
+    `INSERT INTO system_meta (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(key, String(value), nowIso());
+}
+
+// --- FC Core v2.1.0 — arquivos da pasta muse-inbox já processados ---
+
+function getProcessedInboxFile(db, filename) {
+  return db.prepare('SELECT * FROM processed_inbox_files WHERE filename = ?').get(filename) || null;
+}
+
+function findProcessedInboxBySha(db, sha256) {
+  return db.prepare('SELECT * FROM processed_inbox_files WHERE sha256 = ? ORDER BY created_at LIMIT 1').get(sha256) || null;
+}
+
+function recordProcessedInboxFile(db, { filename, sha256 = null, orderId = null, status, reason = null }) {
+  db.prepare(
+    `INSERT INTO processed_inbox_files (filename, sha256, order_id, status, reason, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(filename) DO UPDATE SET sha256 = excluded.sha256, order_id = excluded.order_id,
+       status = excluded.status, reason = excluded.reason, created_at = excluded.created_at`
+  ).run(filename, sha256, orderId, status, reason, nowIso());
+}
+
 module.exports = {
   STATES,
   STATE_ORDER,
@@ -252,4 +353,9 @@ module.exports = {
   listPhotos,
   listOrders,
   listEvents,
+  getMeta,
+  setMeta,
+  getProcessedInboxFile,
+  findProcessedInboxBySha,
+  recordProcessedInboxFile,
 };

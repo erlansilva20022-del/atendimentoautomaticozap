@@ -7,21 +7,32 @@
 // - GET /api/orders/:id/preview-file: baixa a prévia com marca (protegido, usado pela extensão).
 // - POST /api/orders/:id/mark-preview-sent: registra o envio confirmado pela extensão (protegido).
 // - POST /api/orders/:id/mark-final-sent: registra o envio do HD confirmado (protegido).
-// - GET /api/orders/:id: status, fotos, eventos e registro de envios.
+// - POST /api/orders/:id/mark-preview-sent-override: confirmação manual do dono, SÓ admin,
+//   com motivo registrado (nunca usada pelo fluxo automático).
+// - GET /api/orders/:id: status, fotos, eventos, registro de envios e trabalhos da fila.
 // - POST /api/leases/acquire|release, GET /api/leases/:phone: lease de executor único.
 // - GET /api/ledger: registro de envios (anti-duplicação).
 // - POST /api/admin/import-bridge3007, GET /api/admin/import-conflicts: importação do
 //   histórico da FC Bridge 3007 (só admin).
+// - POST /api/admin/reconcile-historical-sends, GET /api/admin/reconciliation-report:
+//   reconciliação de envios históricos — registra o passado, nunca reenvia nem muda estados.
+// - POST /api/jobs, GET /api/jobs, GET /api/jobs/:id: fila persistente de trabalhos.
+// - POST /api/extension/heartbeat: a extensão informa estado da sessão e do envio.
+// - POST /api/admin/record-backup: registra quando o último backup foi feito.
 // - POST /api/orders/:id/confirm-payment e /send-preview: só com ADMIN_TOKEN.
 // FC Core v2.0.0: todos os envios passam pelo registro de envios (sendLedger) —
 // duplicata, envio em andamento, envio incerto anterior ou lease de outro executor
 // recusam o envio ANTES de mandar. Envio incerto joga o pedido para REVISAO.
+// FC Core v2.1.0: envio automático EXIGE lease válido do executor; confirmação
+// EXIGE whatsappMessageId; rotas de dados do cliente exigem autenticação.
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const dbMod = require('./db');
 const ledger = require('./sendLedger');
+const jobsMod = require('./jobs');
+const reconcile = require('./reconcile');
 const migrate = require('./migrate3007');
 const { sha256Buffer } = require('./hash');
 const { makePreview } = require('./watermark');
@@ -74,6 +85,22 @@ function requireAdmin(req, res, next) {
     return res.status(401).json({ ok: false, error: 'admin token inválido' });
   }
   next();
+}
+
+// FC Core v2.1.0 — autenticação para rotas que expõem dados do cliente
+// (pedidos, fotos, registro de envios, leases, trabalhos da fila).
+// Aceita o token de admin OU o token da ponte (a extensão possui o segundo).
+// Se nenhum dos dois estiver configurado, libera (uso local sem tokens, como na v1.2.0).
+// Se pelo menos um estiver configurado, exige um dos dois — sem token, 401.
+function requireClientData(req, res, next) {
+  if (!config.adminToken && !config.bridgeToken) return next();
+  const admin = req.headers['x-admin-token'] || req.query.token;
+  const bridge = req.headers['x-bridge-token'];
+  if ((config.adminToken && admin === config.adminToken) ||
+      (config.bridgeToken && bridge === config.bridgeToken)) {
+    return next();
+  }
+  return res.status(401).json({ ok: false, error: 'autenticação necessária (admin ou ponte)' });
 }
 
 function createBridgeRouter(db, whatsapp) {
@@ -182,8 +209,8 @@ function createBridgeRouter(db, whatsapp) {
     return res.json({ ok: true, orderId, status: updated.status, sha256: hash, bytes: bytes.length, path: filePath, previewPath });
   });
 
-  // Status completo do pedido.
-  router.get('/api/orders/:id', (req, res) => {
+  // Status completo do pedido (rota de dados do cliente — autenticada na v2.1.0).
+  router.get('/api/orders/:id', requireClientData, (req, res) => {
     const status = service.getStatus(req.params.id);
     if (!status) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
     return res.json({ ok: true, order: status });
@@ -207,6 +234,8 @@ function createBridgeRouter(db, whatsapp) {
   // A extensão só chama depois de confirmar o balão de foto no WhatsApp, e
   // passa a evidência (id da mensagem). Confirma o registro de envio e avança
   // o pedido. Idempotente: confirmar de novo não duplica nada.
+  // FC Core v2.1.0: whatsappMessageId é OBRIGATÓRIO — sem evidência verificável,
+  // a confirmação é recusada com 400 (não existe mais confirmação "sem id").
   router.post('/api/orders/:id/mark-preview-sent', requireBridge, (req, res) => {
     try {
       const order = dbMod.getOrder(db, req.params.id);
@@ -214,15 +243,46 @@ function createBridgeRouter(db, whatsapp) {
       const previews = dbMod.listPhotos(db, req.params.id, 'preview');
       if (previews.length === 0) return res.status(400).json({ ok: false, error: 'prévia ainda não gerada' });
       const preview = previews[previews.length - 1];
-      const evidence = (req.body && (req.body.whatsappMessageId || req.body.evidence)) || null;
+      const evidence = req.body && req.body.whatsappMessageId;
+      if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
+        return res.status(400).json({ ok: false, error: 'whatsappMessageId é obrigatório para confirmar o envio' });
+      }
       const executorId = (req.body && req.body.executorId) || null;
       const { record, duplicate } = ledger.confirmSendForPhoto(db, {
         orderId: order.id, phone: order.phone, action: 'preview', imageKind: 'preview',
         imagePath: preview.path, imageSha256: preview.sha256, imageBytes: preview.bytes,
-        executorId, evidence,
+        executorId, evidence: evidence.trim(),
       });
       const updated = service.markPreviewSent(req.params.id);
       return res.json({ ok: true, order: updated, ledger: record, duplicate });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+  });
+
+  // Confirmação manual do dono (override, SÓ admin): confirma o envio da prévia
+  // sem whatsappMessageId, mas registra QUEM confirmou e POR QUÊ (evento
+  // 'envio_confirmado_override' + evidence 'override:<motivo>'). Nunca é usada
+  // pelo fluxo automático — só por decisão explícita do dono no painel.
+  router.post('/api/orders/:id/mark-preview-sent-override', requireAdmin, (req, res) => {
+    try {
+      const order = dbMod.getOrder(db, req.params.id);
+      if (!order) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
+      const previews = dbMod.listPhotos(db, req.params.id, 'preview');
+      if (previews.length === 0) return res.status(400).json({ ok: false, error: 'prévia ainda não gerada' });
+      const preview = previews[previews.length - 1];
+      const reason = req.body && req.body.reason;
+      const overriddenBy = (req.body && req.body.overriddenBy) || 'admin';
+      if (!reason || typeof reason !== 'string' || !reason.trim()) {
+        return res.status(400).json({ ok: false, error: 'reason é obrigatório no override' });
+      }
+      const { record, duplicate } = ledger.confirmSendOverride(db, {
+        orderId: order.id, phone: order.phone, action: 'preview', imageKind: 'preview',
+        imagePath: preview.path, imageSha256: preview.sha256, imageBytes: preview.bytes,
+        overriddenBy, reason: reason.trim(),
+      });
+      const updated = service.markPreviewSent(req.params.id);
+      return res.json({ ok: true, order: updated, ledger: record, duplicate, override: true });
     } catch (err) {
       return res.status(400).json({ ok: false, error: err.message });
     }
@@ -232,18 +292,22 @@ function createBridgeRouter(db, whatsapp) {
   // Só é válido após PAGAMENTO_CONFIRMADO; se o estado estiver errado, o envio
   // fica registrado no ledger com a evidência, mas a transição falha e o pedido
   // vai para revisão manual.
+  // FC Core v2.1.0: whatsappMessageId é OBRIGATÓRIO.
   router.post('/api/orders/:id/mark-final-sent', requireBridge, (req, res) => {
     const order = dbMod.getOrder(db, req.params.id);
     if (!order) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
     const finals = dbMod.listPhotos(db, req.params.id, 'final');
     if (finals.length === 0) return res.status(400).json({ ok: false, error: 'arquivo final não encontrado' });
     const versionHash = ledger.versionHashForPhotos(finals);
-    const evidence = (req.body && (req.body.whatsappMessageId || req.body.evidence)) || null;
+    const evidence = req.body && req.body.whatsappMessageId;
+    if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
+      return res.status(400).json({ ok: false, error: 'whatsappMessageId é obrigatório para confirmar o envio' });
+    }
     const executorId = (req.body && req.body.executorId) || null;
     const { record } = ledger.confirmSendForPhoto(db, {
       orderId: order.id, phone: order.phone, action: 'final', imageKind: 'final',
       imagePath: finals[0].path, imageSha256: versionHash,
-      imageBytes: finals.reduce((s, f) => s + f.bytes, 0), executorId, evidence,
+      imageBytes: finals.reduce((s, f) => s + f.bytes, 0), executorId, evidence: evidence.trim(),
     });
     try {
       const updated = service.markFinalDelivered(req.params.id);
@@ -285,12 +349,13 @@ function createBridgeRouter(db, whatsapp) {
     return res.json({ ok: true });
   });
 
-  router.get('/api/leases/:phone', (req, res) => {
+  router.get('/api/leases/:phone', requireClientData, (req, res) => {
     return res.json({ ok: true, lease: ledger.getLease(db, req.params.phone) });
   });
 
   // Registro de envios (somente leitura). ?orderId= filtra por pedido.
-  router.get('/api/ledger', (req, res) => {
+  // Rota de dados do cliente — autenticada na v2.1.0.
+  router.get('/api/ledger', requireClientData, (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 500);
     return res.json({ ok: true, ledger: ledger.listLedger(db, req.query.orderId || null, limit) });
   });
@@ -311,8 +376,84 @@ function createBridgeRouter(db, whatsapp) {
     return res.json({ ok: true, conflicts: migrate.listConflicts(db, 100) });
   });
 
-  // Lista resumida de pedidos (dashboard).
-  router.get('/api/orders', (req, res) => {
+  // --- FC Core v2.1.0 — fila persistente de trabalhos ---
+
+  // Cria um trabalho na fila (só admin). Envios de foto (send_preview/send_final)
+  // nunca repetem automaticamente: falha vira 'needs_review' + REVISAO.
+  router.post('/api/jobs', requireAdmin, (req, res) => {
+    try {
+      const job = jobsMod.createJob(db, req.body || {});
+      return res.json({ ok: true, job });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+  });
+
+  // Lista trabalhos da fila (dados do cliente — autenticada). Filtros: ?status= ?orderId=
+  router.get('/api/jobs', requireClientData, (req, res) => {
+    const jobs = jobsMod.listJobs(db, {
+      status: req.query.status || null,
+      orderId: req.query.orderId || null,
+      limit: parseInt(req.query.limit || '100', 10) || 100,
+    });
+    return res.json({ ok: true, jobs, counts: jobsMod.countPendingJobs(db) });
+  });
+
+  router.get('/api/jobs/:id', requireClientData, (req, res) => {
+    const job = jobsMod.getJob(db, req.params.id);
+    if (!job) return res.status(404).json({ ok: false, error: 'trabalho não encontrado' });
+    return res.json({ ok: true, job });
+  });
+
+  // --- FC Core v2.1.0 — reconciliação de envios históricos ---
+
+  // Registra envios históricos CONFIRMADOS no ledger, SEM reenviar arquivos e
+  // SEM mudar o estado de nenhum pedido. Entradas sem evidência suficiente
+  // ficam como 'review' (só revisão manual). Não serve para "refazer" o fluxo
+  // de um pedido AGUARDANDO_APROVACAO — só registra o passado.
+  router.post('/api/admin/reconcile-historical-sends', requireAdmin, (req, res) => {
+    try {
+      const summary = reconcile.reconcileHistoricalSends(db, (req.body && req.body.entries) || []);
+      return res.json(summary);
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+  });
+
+  router.get('/api/admin/reconciliation-report', requireAdmin, (req, res) => {
+    return res.json(reconcile.reconciliationReport(db, parseInt(req.query.limit || '100', 10) || 100));
+  });
+
+  // --- FC Core v2.1.0 — heartbeat da extensão e registro de backup ---
+
+  // A extensão única informa periodicamente: sessão do WhatsApp autenticada?
+  // Envio automático ligado? Última captura? O /health passa a mostrar esses
+  // estados separadamente (Core, extensão e sessão) — ou 'unknown' se a
+  // extensão nunca reportou.
+  router.post('/api/extension/heartbeat', requireBridge, (req, res) => {
+    const body = req.body || {};
+    dbMod.setMeta(db, 'extension_last_heartbeat', new Date().toISOString());
+    if (body.executorId) dbMod.setMeta(db, 'extension_executor_id', String(body.executorId));
+    if (typeof body.whatsappAuthenticated === 'boolean') {
+      dbMod.setMeta(db, 'extension_whatsapp_authenticated', String(body.whatsappAuthenticated));
+    }
+    if (typeof body.autoSend === 'boolean') {
+      dbMod.setMeta(db, 'extension_auto_send', String(body.autoSend));
+    }
+    if (body.lastCaptureAt) dbMod.setMeta(db, 'extension_last_capture_at', String(body.lastCaptureAt));
+    return res.json({ ok: true });
+  });
+
+  // Registra quando o último backup foi feito (chamado pelo script de backup).
+  router.post('/api/admin/record-backup', requireAdmin, (req, res) => {
+    const at = (req.body && req.body.at) || new Date().toISOString();
+    dbMod.setMeta(db, 'last_backup_at', String(at));
+    if (req.body && req.body.path) dbMod.setMeta(db, 'last_backup_path', String(req.body.path));
+    return res.json({ ok: true, lastBackupAt: at });
+  });
+
+  // Lista resumida de pedidos (dashboard) — dados do cliente, autenticada na v2.1.0.
+  router.get('/api/orders', requireClientData, (req, res) => {
     const orders = dbMod.listOrders(db, 100).map((o) => ({
       ...o,
       photos: dbMod.listPhotos(db, o.id).length,
@@ -350,8 +491,9 @@ function createBridgeRouter(db, whatsapp) {
       return res.status(409).json({ ok: false, error: `envio recusado (${guard.reason})`, reason: guard.reason, existing: guard.existing || null });
     }
     try {
-      const sent = await whatsapp.sendPreview(req.params.id, { executorId });
-      const evidence = (sent && sent.id && (sent.id._serialized || sent.id.id)) || 'admin-api';
+      const sent = await whatsapp.sendPreview(req.params.id, { executorId, guardKey: guard.key });
+      const evidence = sent && sent.id && (sent.id._serialized || sent.id.id);
+      if (!evidence) throw new Error('envio da prévia sem confirmação do WhatsApp');
       ledger.confirmSend(db, guard.key, evidence);
       try { service.markPreviewSent(req.params.id); } catch {}
       return res.json({ ok: true, order: dbMod.getOrder(db, req.params.id) });
@@ -388,8 +530,10 @@ function createBridgeRouter(db, whatsapp) {
       return res.status(409).json({ ok: false, error: `envio recusado (${guard.reason})`, reason: guard.reason, existing: guard.existing || null });
     }
     try {
-      const sent = await whatsapp.sendFinal(req.params.id, { executorId });
-      const evidence = (sent && sent.id && (sent.id._serialized || sent.id.id)) || 'admin-api';
+      const evidence = await whatsapp.sendFinal(req.params.id, { executorId, guardKey: guard.key });
+      if (!evidence || typeof evidence !== 'string') {
+        throw new Error('envio do HD sem confirmação do WhatsApp');
+      }
       ledger.confirmSend(db, guard.key, evidence);
       try { service.markFinalDelivered(req.params.id); } catch {}
       return res.json({ ok: true, order: dbMod.getOrder(db, req.params.id) });

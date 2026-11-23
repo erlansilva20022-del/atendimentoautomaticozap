@@ -23,7 +23,11 @@ const config = {
   autoReplyEnabled: process.env.AUTO_REPLY_ENABLED === 'true',
   // FC Core v2.0.0 — lease de executor único (TTL em segundos; padrão 120s).
   leaseTtlSeconds: parseInt(process.env.LEASE_TTL_SECONDS || '120', 10),
-  version: '2.0.0',
+  // FC Core v2.1.0 — intervalo do worker da fila persistente (ms; padrão 5000).
+  jobWorkerIntervalMs: parseInt(process.env.JOB_WORKER_INTERVAL_MS || '5000', 10),
+  // FC Core v2.1.0 — alerta de disco: espaço livre (GB) abaixo disto = "low" no /health.
+  diskWarnFreeGb: parseFloat(process.env.DISK_WARN_FREE_GB || '5'),
+  version: '2.1.0',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };
