@@ -7,7 +7,7 @@ d'água primeiro**, aprova, paga — e só então recebe o **HD original sem mar
 Tudo roda **localmente no PC do dono** (Windows). Nada vai para nuvem pública,
 nenhuma foto de cliente é enviada para serviço externo sem autorização.
 
-## Arquitetura — FC Core v2.1.2 (um backend, uma extensão, um painel)
+## Arquitetura — FC Core v2.1.3 (um backend, uma extensão, um painel)
 
 ```
 WhatsApp Web (1 aba) ──┐
@@ -187,6 +187,26 @@ incerto — a proteção existia só na extensão. A v2.1.2 fecha isso:
   `acquire lease` → `reserve` → clica no WhatsApp → se o resultado for
   desconhecido, `POST /api/sends/uncertain {reservationId, executorId,
   reason}` na hora (não espera a reserva expirar).
+
+## O que mudou na v2.1.3 (reserva de FINAL só após pagamento confirmado — fecha a brecha da v2.1.2)
+
+A rota de admin (`POST /api/orders/:id/send-final`) já exigia
+`PAGAMENTO_CONFIRMADO`, mas a rota automática de reserva
+(`POST /api/sends/reserve`) não aplicava essa checagem: aceitava reservar
+uma foto FINAL mesmo com o pedido ainda aguardando a aprovação da prévia.
+Brecha encontrada (e corrigida localmente no PC) pelo GPT na instalação da
+v2.1.2. A v2.1.3 traz a mesma proteção para o repositório:
+
+- **Reserva de FINAL exige `PAGAMENTO_CONFIRMADO`:** em `reserveSend`, quando
+  a ação é `final`, o estado do pedido precisa ser exatamente
+  `PAGAMENTO_CONFIRMADO`; qualquer outro estado é recusado com 409
+  (`final_manual_only`). A checagem fica dentro de `reserveSend`, então nenhum
+  chamador da reserva consegue contorná-la. A rota de admin continua com a
+  sua própria checagem de `PAGAMENTO_CONFIRMADO`, e o override de admin não
+  muda. A entrega do HD continua sendo manual/admin — só após o pagamento
+  confirmado.
+- **Reservas de prévia não mudam:** seguem funcionando nos estados normais
+  de pré-aprovação.
 
 ## O fluxo
 

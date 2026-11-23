@@ -50,9 +50,11 @@ function getReservationById(db, reservationId) {
 //   - o executor detém um lease válido daquela conversa;
 //   - não existe envio confirmado/incerto/em andamento (reserva viva) para a chave;
 //   - o sha256 pertence a uma foto registrada do pedido, com o tipo certo
-//     (para 'final', o sha256 é o hash da versão do conjunto de fotos finais).
+//     (para 'final', o sha256 é o hash da versão do conjunto de fotos finais);
+//   - para 'final': o pedido está em PAGAMENTO_CONFIRMADO (v2.1.3 —
+//     final_manual_only caso contrário; o HD só sai após o pagamento confirmado).
 // Retorna { ok: true, reservationId, dedupKey, expiresAt, record } ou
-// { ok: false, error: 'no_lease'|'duplicate'|'uncertain'|'in_progress'|... }.
+// { ok: false, error: 'no_lease'|'duplicate'|'uncertain'|'in_progress'|'final_manual_only'|... }.
 // Uma reserva expirada pode ser renovada (o registro é atualizado no lugar,
 // com novo reservation_id) — o envio nunca aconteceu, então não há nada
 // incerto para revisar; a confirmação de uma reserva expirada é que é incerta.
@@ -65,6 +67,15 @@ function reserveSend(db, { orderId, phone, action, imageKind, imageSha256, execu
   const order = dbMod.getOrder(db, orderId);
   if (!order) return { ok: false, error: 'pedido_nao_encontrado' };
   if (order.phone !== phone) return { ok: false, error: 'phone_nao_confere' };
+  // FC Core v2.1.3 — o HD final só pode ser reservado após PAGAMENTO_CONFIRMADO.
+  // A rota de admin (/api/orders/:id/send-final) já exigia isso, mas a reserva
+  // automática aceitava reservar um FINAL com o pedido ainda aguardando a
+  // aprovação da prévia — brecha encontrada (e corrigida localmente) pelo GPT
+  // na instalação da v2.1.2. Reserva de FINAL antes do pagamento confirmado é
+  // recusada com 'final_manual_only'; o HD continua sendo entrega manual/admin.
+  if (action === 'final' && order.status !== 'PAGAMENTO_CONFIRMADO') {
+    return { ok: false, error: 'final_manual_only' };
+  }
   // O executor precisa deter um lease válido da conversa AGORA.
   const lease = getLease(db, phone);
   if (!lease || lease.executor_id !== executorId) return { ok: false, error: 'no_lease' };

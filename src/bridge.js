@@ -409,6 +409,7 @@ function createBridgeRouter(db, whatsapp) {
           dados_incompletos: 400,
           acao_invalida: 400,
           executor_obrigatorio: 400,
+          final_manual_only: 409,
           no_lease: 409,
           duplicate: 409,
           uncertain: 409,

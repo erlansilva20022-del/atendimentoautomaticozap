@@ -35,7 +35,7 @@ const config = {
   // Sem heartbeat dentro deste prazo, o /health mostra a extensão e a sessão
   // do WhatsApp como 'stale'/'unknown' — nunca como autenticada indefinidamente.
   heartbeatTtlSeconds: parseInt(process.env.HEARTBEAT_TTL_SECONDS || '120', 10),
-  version: '2.1.2',
+  version: '2.1.3',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };
