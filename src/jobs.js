@@ -92,17 +92,52 @@ function claimDueJob(db, workerId) {
 }
 
 // Devolve para 'pending' trabalhos travados em 'in_progress' há mais de
-// staleAfterMs (ex.: o processo caiu no meio da execução). A retomada é segura:
-// envios passam pela trava do registro de envios antes de mandar.
+// staleAfterMs (ex.: o processo caiu no meio da execução). A retomada é segura
+// para leituras/downloads/verificações (retry com backoff).
+// FC Core v2.1.1 — trabalhos de ENVIO travados NÃO voltam para a fila: um envio
+// interrompido vira 'needs_review' (via failJob, que joga o pedido para REVISAO).
+// Reenviar automaticamente um envio cujo resultado ficou incerto poderia duplicar
+// a foto no WhatsApp — só revisão manual decide o próximo passo.
 function requeueStaleJobs(db, staleAfterMs = 10 * 60 * 1000) {
   const threshold = new Date(Date.now() - staleAfterMs).toISOString();
-  const res = db.prepare(
-    "UPDATE jobs SET status = 'pending', owner = NULL, updated_at = ? WHERE status = 'in_progress' AND updated_at < ?"
-  ).run(dbMod.nowIso(), threshold);
-  if (res.changes > 0) {
-    log('warn', 'trabalhos travados devolvidos para a fila', { count: res.changes });
+  const stale = db.prepare(
+    "SELECT * FROM jobs WHERE status = 'in_progress' AND updated_at < ? ORDER BY updated_at"
+  ).all(threshold);
+  let requeued = 0;
+  for (const job of stale) {
+    if (SEND_KINDS.has(job.kind)) {
+      failJob(db, job.id, 'trabalho de envio interrompido — revisão manual (sem retorno automático à fila)');
+    } else {
+      const res = db.prepare(
+        "UPDATE jobs SET status = 'pending', owner = NULL, updated_at = ? WHERE id = ? AND status = 'in_progress'"
+      ).run(dbMod.nowIso(), job.id);
+      requeued += res.changes;
+    }
   }
-  return res.changes;
+  if (requeued > 0) {
+    log('warn', 'trabalhos travados devolvidos para a fila', { count: requeued });
+  }
+  return requeued;
+}
+
+// FC Core v2.1.1 — na inicialização do processo, trabalhos de envio que ficaram
+// em 'in_progress' (o processo caiu/reiniciou no meio do envio) vão DIRETO para
+// 'needs_review' — NUNCA voltam automaticamente para a fila. Um envio
+// interrompido tem resultado desconhecido (a foto pode já ter sido entregue);
+// só revisão manual, com conferência no histórico do WhatsApp, decide se
+// houve envio e qual é o próximo passo. Chamado em index.js na subida do
+// servidor, antes do worker começar. Trabalhos que não são envio não são tocados.
+function markInterruptedSendJobsNeedsReview(db) {
+  const interrupted = db.prepare(
+    "SELECT * FROM jobs WHERE status = 'in_progress' AND kind IN ('send_preview', 'send_final') ORDER BY updated_at"
+  ).all();
+  for (const job of interrupted) {
+    failJob(db, job.id, 'processo reiniciado durante o envio — revisão manual');
+  }
+  if (interrupted.length > 0) {
+    log('warn', 'envios interrompidos pelo reinício enviados para revisão', { count: interrupted.length });
+  }
+  return interrupted.length;
 }
 
 function completeJob(db, id, result = null) {
@@ -209,6 +244,7 @@ module.exports = {
   countPendingJobs,
   claimDueJob,
   requeueStaleJobs,
+  markInterruptedSendJobsNeedsReview,
   completeJob,
   failJob,
   createJobWorker,

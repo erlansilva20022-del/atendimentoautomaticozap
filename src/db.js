@@ -185,6 +185,20 @@ function initDb(dbPath = config.databasePath) {
       updated_at TEXT NOT NULL
     );
   `);
+  // FC Core v2.1.1 — migração da reserva atômica de envio: o registro de envios
+  // ganha reservation_id/reserved_at/expires_at. Bancos antigos (v2.0.0/v2.1.0)
+  // recebem as colunas na abertura, sem recriar a tabela nem perder registros.
+  const ledgerCols = db.prepare('PRAGMA table_info(send_ledger)').all().map((c) => c.name);
+  for (const [col, def] of [
+    ['reservation_id', 'TEXT'],
+    ['reserved_at', 'TEXT'],
+    ['expires_at', 'TEXT'],
+  ]) {
+    if (!ledgerCols.includes(col)) {
+      db.exec(`ALTER TABLE send_ledger ADD COLUMN ${col} ${def}`);
+    }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ledger_reservation ON send_ledger(reservation_id)');
   return db;
 }
 

@@ -12,6 +12,10 @@
 // - Sem evidência suficiente (sem whatsappMessageId, hash não registrado no
 //   pedido, telefone divergente, pedido inexistente), a entrada fica como
 //   'review' (só revisão manual) e NÃO entra no ledger como confirmada.
+// - FC Core v2.1.1 — validação estrita por entrada: o tipo da imagem precisa
+//   ser o tipo da foto registrada com aquele hash, o telefone precisa ser o do
+//   pedido e o whatsappMessageId precisa ter o formato real do WhatsApp Web
+//   (prefixo "wamid."). Cada falha vira 'review' com o motivo específico.
 // - Chave já registrada no ledger (confirmada ou incerta) vira 'skipped' —
 //   nunca duplica o registro.
 const dbMod = require('./db');
@@ -19,6 +23,11 @@ const ledger = require('./sendLedger');
 const { log } = require('./logger');
 
 const SHA256_RE = /^[0-9a-f]{64}$/i;
+// FC Core v2.1.1 — o id de mensagem do WhatsApp Web começa com "wamid." seguido
+// de um identificador (ex.: wamid.HBgMOTE...). Texto genérico ("ok", "enviado",
+// "12345") NÃO é evidência — é recusado como 'evidencia_invalida' e fica só
+// em revisão. Nunca inventar um whatsappMessageId.
+const WAMID_RE = /^wamid\.[A-Za-z0-9+/=_-]{4,}$/;
 
 function reconcileHistoricalSends(db, entries) {
   if (!Array.isArray(entries)) throw new Error('entries deve ser um array');
@@ -69,12 +78,23 @@ function reconcileHistoricalSends(db, entries) {
       review('sem_evidencia_whatsapp');
       continue;
     }
-    // O hash precisa pertencer a uma foto registrada do pedido — senão não dá
-    // para afirmar que aquele envio foi desta imagem.
+    // FC Core v2.1.1 — a evidência precisa parecer um id real de mensagem do
+    // WhatsApp (prefixo "wamid."). Texto genérico não é evidência.
+    if (!WAMID_RE.test(whatsappMessageId.trim())) {
+      review('evidencia_invalida');
+      continue;
+    }
+    // O hash precisa pertencer a uma foto registrada do pedido, COM O TIPO CERTO
+    // (FC Core v2.1.1) — um hash de 'final' não valida um envio de 'preview' e
+    // vice-versa. Sem isso não dá para afirmar que aquele envio foi desta imagem.
     const photos = dbMod.listPhotos(db, orderId);
     const photo = photos.find((p) => p.sha256.toLowerCase() === String(sha256).toLowerCase());
     if (!photo) {
       review('hash_nao_registrado_no_pedido');
+      continue;
+    }
+    if (photo.kind !== imageKind) {
+      review('image_kind_nao_confere');
       continue;
     }
     // Confirma o envio histórico no ledger — sem tocar no estado do pedido.

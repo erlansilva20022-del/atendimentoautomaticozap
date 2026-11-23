@@ -58,13 +58,22 @@ function createServer(db, whatsapp) {
       }
     } catch {}
     // Estados da extensão e da sessão do WhatsApp (via heartbeat da extensão).
-    let extensionState = { state: 'unknown' };
+    // FC Core v2.1.1 — o heartbeat EXPIRA: sem heartbeat dentro de
+    // HEARTBEAT_TTL_SECONDS (padrão 120s), a extensão vira 'stale' e a sessão
+    // do WhatsApp vira 'unknown' — nunca é mostrada como autenticada
+    // indefinidamente. O /health expõe o limite e a idade do último heartbeat.
+    let extensionState = { state: 'unknown', heartbeatAgeMs: null, heartbeatTtlSeconds: config.heartbeatTtlSeconds || 120 };
+    let heartbeatAgeMs = null;
     try {
       const hb = dbMod.getMeta(db, 'extension_last_heartbeat');
       if (hb) {
+        heartbeatAgeMs = Math.max(0, Date.now() - new Date(hb).getTime());
+        const stale = heartbeatAgeMs > (config.heartbeatTtlSeconds || 120) * 1000;
         extensionState = {
-          state: 'reported',
+          state: stale ? 'stale' : 'reported',
           lastHeartbeat: hb,
+          heartbeatAgeMs,
+          heartbeatTtlSeconds: config.heartbeatTtlSeconds || 120,
           executorId: dbMod.getMeta(db, 'extension_executor_id') || null,
           whatsappAuthenticated: dbMod.getMeta(db, 'extension_whatsapp_authenticated'),
           autoSend: dbMod.getMeta(db, 'extension_auto_send'),
@@ -73,9 +82,14 @@ function createServer(db, whatsapp) {
       }
     } catch {}
     const whatsappSession = {
-      state: extensionState.whatsappAuthenticated === 'true'
-        ? 'authenticated'
-        : (extensionState.whatsappAuthenticated === 'false' ? 'disconnected' : 'unknown'),
+      state: extensionState.state === 'stale'
+        ? 'unknown'
+        : (extensionState.whatsappAuthenticated === 'true'
+          ? 'authenticated'
+          : (extensionState.whatsappAuthenticated === 'false' ? 'disconnected' : 'unknown')),
+      lastHeartbeat: extensionState.lastHeartbeat || null,
+      heartbeatAgeMs,
+      heartbeatTtlSeconds: config.heartbeatTtlSeconds || 120,
     };
     // Espaço em disco (alerta quando livre abaixo do limite configurado).
     let disk = { freeBytes: null, freeGb: null, low: null };
@@ -117,6 +131,7 @@ function createServer(db, whatsapp) {
       },
       disk,
       lastBackupAt,
+      heartbeatTtlSeconds: config.heartbeatTtlSeconds || 120,
     });
   });
 

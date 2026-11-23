@@ -27,7 +27,15 @@ const config = {
   jobWorkerIntervalMs: parseInt(process.env.JOB_WORKER_INTERVAL_MS || '5000', 10),
   // FC Core v2.1.0 — alerta de disco: espaço livre (GB) abaixo disto = "low" no /health.
   diskWarnFreeGb: parseFloat(process.env.DISK_WARN_FREE_GB || '5'),
-  version: '2.1.0',
+  // FC Core v2.1.1 — TTL da reserva atômica de envio (segundos; padrão 600 = 10 min).
+  // A extensão reserva o envio antes de clicar no WhatsApp; a confirmação só
+  // vale dentro deste prazo e com o lease ainda válido.
+  reservationTtlSeconds: parseInt(process.env.RESERVATION_TTL_SECONDS || '600', 10),
+  // FC Core v2.1.1 — TTL do heartbeat da extensão (segundos; padrão 120).
+  // Sem heartbeat dentro deste prazo, o /health mostra a extensão e a sessão
+  // do WhatsApp como 'stale'/'unknown' — nunca como autenticada indefinidamente.
+  heartbeatTtlSeconds: parseInt(process.env.HEARTBEAT_TTL_SECONDS || '120', 10),
+  version: '2.1.1',
   // Modo de atendimento: o Muse é o atendente principal; o backend só faz logística de imagem.
   frontdeskMode: 'muse',
 };

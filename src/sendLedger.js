@@ -1,4 +1,9 @@
 // FC Core v2.0.0 — registro de envios (anti-duplicação) e lease de executor único.
+// FC Core v2.1.1 — reserva atômica de envio: a extensão reserva o envio ANTES de
+// clicar no WhatsApp (POST /api/sends/reserve) e só confirma com o reservationId
+// + whatsappMessageId dentro do TTL e com o lease ainda válido. Sem reserva não
+// há confirmação no fluxo automático — mark-preview-sent/mark-final-sent não
+// registram mais um envio confirmado "do nada".
 //
 // Regras duras:
 // - Um envio é identificado por (pedido, ação, tipo de imagem, SHA-256 da imagem).
@@ -15,6 +20,9 @@ const dbMod = require('./db');
 const { config } = require('./config');
 
 const LEASE_TTL_MS = (config.leaseTtlSeconds || 120) * 1000;
+// FC Core v2.1.1 — TTL padrão da reserva de envio (10 min): tempo que a extensão
+// tem entre reservar e confirmar, antes da reserva expirar.
+const RESERVATION_TTL_MS = (config.reservationTtlSeconds || 600) * 1000;
 
 function dedupKey(orderId, action, imageKind, imageSha256) {
   return `${orderId}|${action}|${imageKind}|${imageSha256}`;
@@ -22,6 +30,159 @@ function dedupKey(orderId, action, imageKind, imageSha256) {
 
 function getLedgerByKey(db, key) {
   return db.prepare('SELECT * FROM send_ledger WHERE dedup_key = ?').get(key) || null;
+}
+
+function getReservationById(db, reservationId) {
+  if (!reservationId) return null;
+  return db.prepare('SELECT * FROM send_ledger WHERE reservation_id = ?').get(reservationId) || null;
+}
+
+// FC Core v2.1.1 — reserva atômica de envio.
+//
+// A extensão chama ANTES de clicar no WhatsApp: o Core cria (ou renova) um
+// registro 'pending' com reservation_id + expiração, de forma atômica, SÓ se:
+//   - o executor detém um lease válido daquela conversa;
+//   - não existe envio confirmado/incerto/em andamento (reserva viva) para a chave;
+//   - o sha256 pertence a uma foto registrada do pedido, com o tipo certo
+//     (para 'final', o sha256 é o hash da versão do conjunto de fotos finais).
+// Retorna { ok: true, reservationId, dedupKey, expiresAt, record } ou
+// { ok: false, error: 'no_lease'|'duplicate'|'uncertain'|'in_progress'|... }.
+// Uma reserva expirada pode ser renovada (o registro é atualizado no lugar,
+// com novo reservation_id) — o envio nunca aconteceu, então não há nada
+// incerto para revisar; a confirmação de uma reserva expirada é que é incerta.
+function reserveSend(db, { orderId, phone, action, imageKind, imageSha256, executorId, ttlMs = RESERVATION_TTL_MS }) {
+  if (!orderId || !phone || !action || !imageKind || !imageSha256) {
+    return { ok: false, error: 'dados_incompletos' };
+  }
+  if (!executorId) return { ok: false, error: 'executor_obrigatorio' };
+  if (!['preview', 'final'].includes(action)) return { ok: false, error: 'acao_invalida' };
+  const order = dbMod.getOrder(db, orderId);
+  if (!order) return { ok: false, error: 'pedido_nao_encontrado' };
+  if (order.phone !== phone) return { ok: false, error: 'phone_nao_confere' };
+  // O executor precisa deter um lease válido da conversa AGORA.
+  const lease = getLease(db, phone);
+  if (!lease || lease.executor_id !== executorId) return { ok: false, error: 'no_lease' };
+  // O hash precisa pertencer a uma foto registrada do pedido, com o tipo certo.
+  let imagePath;
+  let imageBytes;
+  if (action === 'final') {
+    const finals = dbMod.listPhotos(db, orderId, 'final');
+    if (finals.length === 0 || versionHashForPhotos(finals) !== imageSha256) {
+      return { ok: false, error: 'hash_nao_registrado_no_pedido' };
+    }
+    imagePath = finals[0].path;
+    imageBytes = finals.reduce((s, f) => s + f.bytes, 0);
+  } else {
+    const photo = dbMod.listPhotos(db, orderId, imageKind)
+      .find((p) => p.sha256.toLowerCase() === String(imageSha256).toLowerCase());
+    if (!photo) return { ok: false, error: 'hash_nao_registrado_no_pedido' };
+    imagePath = photo.path;
+    imageBytes = photo.bytes;
+  }
+  const key = dedupKey(orderId, action, imageKind, imageSha256);
+  const now = dbMod.nowIso();
+  const reservationId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  // Atômico: a checagem e a criação/renovação acontecem numa só transação —
+  // duas extensões não reservam a mesma chave ao mesmo tempo.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const existing = getLedgerByKey(db, key);
+    if (existing) {
+      if (existing.status === 'confirmed') {
+        db.exec('COMMIT');
+        return { ok: false, error: 'duplicate', existing };
+      }
+      if (existing.status === 'uncertain') {
+        db.exec('COMMIT');
+        return { ok: false, error: 'uncertain', existing };
+      }
+      if (existing.status === 'pending') {
+        const live = existing.expires_at
+          ? new Date(existing.expires_at).getTime() > Date.now()
+          : true; // 'pending' sem reserva (fluxo interno/admin) = envio em andamento
+        if (live) {
+          db.exec('COMMIT');
+          return { ok: false, error: 'in_progress', existing };
+        }
+        // Reserva expirada: renova no lugar (mesma chave, novo reservation_id).
+        db.prepare(
+          `UPDATE send_ledger SET reservation_id = ?, reserved_at = ?, expires_at = ?,
+             executor_id = ?, updated_at = ? WHERE dedup_key = ?`
+        ).run(reservationId, now, expiresAt, executorId, now, key);
+        dbMod.logEvent(db, orderId, 'reserva_renovada',
+          `${action} key=${key} reserva=${reservationId} expira=${expiresAt}`);
+        db.exec('COMMIT');
+        return { ok: true, reservationId, dedupKey: key, expiresAt, record: getLedgerByKey(db, key) };
+      }
+      db.exec('COMMIT');
+      return { ok: false, error: 'duplicate', existing };
+    }
+    db.prepare(
+      `INSERT INTO send_ledger (dedup_key, order_id, phone, action, image_kind, image_path,
+         image_sha256, image_bytes, status, executor_id, reservation_id, reserved_at,
+         expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`
+    ).run(key, orderId, phone, action, imageKind, imagePath, imageSha256, imageBytes,
+      executorId, reservationId, now, expiresAt, now, now);
+    dbMod.logEvent(db, orderId, 'envio_reservado',
+      `${action} key=${key} reserva=${reservationId} expira=${expiresAt}`);
+    db.exec('COMMIT');
+    return { ok: true, reservationId, dedupKey: key, expiresAt, record: getLedgerByKey(db, key) };
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch {}
+    // Corrida residual: outra transação registrou a chave primeiro.
+    if (String(err.message).includes('UNIQUE')) {
+      const raced = getLedgerByKey(db, key);
+      return { ok: false, error: raced && raced.status === 'confirmed' ? 'duplicate' : 'in_progress', existing: raced };
+    }
+    throw err;
+  }
+}
+
+// FC Core v2.1.1 — confirmação de envio COM reserva.
+//
+// mark-preview-sent / mark-final-sent só confirmam com um reservationId válido:
+// reserva 'pending', do MESMO executor, com o lease ainda válido e dentro do TTL.
+// Sem reserva → { error: 'no_reservation' } (409). Reserva expirada → o envio
+// vira 'uncertain' e o pedido vai para REVISAO (o clique pode ter acontecido e
+// a confirmação chegado tarde — só revisão manual resolve). Lease inválido → 409
+// 'no_lease' e a reserva continua viva até expirar (a extensão pode renovar o
+// lease e tentar confirmar de novo). Idempotente: confirmar de novo com a mesma
+// evidência devolve o registro sem duplicar.
+function confirmReservedSend(db, { reservationId, evidence, executorId = null }) {
+  if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
+    throw new Error('evidência whatsappMessageId é obrigatória para confirmar o envio');
+  }
+  const rec = getReservationById(db, reservationId);
+  if (!rec) return { error: 'no_reservation' };
+  if (rec.status === 'confirmed') {
+    if (rec.evidence === evidence.trim()) return { record: rec, duplicate: true };
+    return { error: 'already_confirmed' };
+  }
+  if (rec.status === 'uncertain') return { error: 'uncertain' };
+  if (rec.status !== 'pending') return { error: 'no_reservation' };
+  // Reserva expirada: o envio é incerto — nunca confirmar automaticamente.
+  if (rec.expires_at && new Date(rec.expires_at).getTime() <= Date.now()) {
+    markUncertain(db, rec.dedup_key, 'reserva_expirada');
+    return { error: 'reservation_expired', needsReview: true };
+  }
+  // A confirmação precisa vir do executor que reservou.
+  if (executorId && rec.executor_id && rec.executor_id !== executorId) {
+    return { error: 'executor_mismatch' };
+  }
+  // O lease precisa continuar válido na hora de confirmar.
+  const lease = getLease(db, rec.phone);
+  if (!lease || lease.executor_id !== rec.executor_id) {
+    return { error: 'no_lease' };
+  }
+  const now = dbMod.nowIso();
+  db.prepare(
+    "UPDATE send_ledger SET status = 'confirmed', evidence = ?, confirmed_at = ?, updated_at = ? WHERE dedup_key = ?"
+  ).run(evidence.trim(), now, now, rec.dedup_key);
+  dbMod.logEvent(db, rec.order_id, 'envio_confirmado',
+    `${rec.action} key=${rec.dedup_key} evidencia=${evidence.trim()} reserva=${reservationId}`);
+  return { record: getLedgerByKey(db, rec.dedup_key), duplicate: false };
 }
 
 function listLedger(db, orderId = null, limit = 100) {
@@ -159,34 +320,6 @@ function confirmSendOverride(db, { orderId, phone, action, imageKind, imagePath,
   return { record: getLedgerByKey(db, key), duplicate: false };
 }
 
-// Registra um envio confirmado que chegou por confirmação explícita da extensão,
-// mesmo sem um registro 'pending' anterior (ex.: a extensão enviou e só depois
-// confirmou). Cria o registro já como 'confirmed' a partir da foto registrada.
-// FC Core v2.1.0: exige evidência (whatsappMessageId) — sem ela, recusa.
-function confirmSendForPhoto(db, { orderId, phone, action, imageKind, imagePath, imageSha256, imageBytes, executorId = null, evidence }) {
-  if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
-    throw new Error('evidência whatsappMessageId é obrigatória para confirmar o envio');
-  }
-  const key = dedupKey(orderId, action, imageKind, imageSha256);
-  const existing = getLedgerByKey(db, key);
-  const now = dbMod.nowIso();
-  if (existing) {
-    if (existing.status === 'confirmed') return { record: existing, duplicate: true };
-    db.prepare(
-      "UPDATE send_ledger SET status = 'confirmed', evidence = ?, confirmed_at = ?, updated_at = ? WHERE dedup_key = ?"
-    ).run(evidence || null, now, now, key);
-    dbMod.logEvent(db, orderId, 'envio_confirmado', `${action} key=${key} evidencia=${evidence || '?'}`);
-    return { record: getLedgerByKey(db, key), duplicate: false };
-  }
-  db.prepare(
-    `INSERT INTO send_ledger (dedup_key, order_id, phone, action, image_kind, image_path,
-      image_sha256, image_bytes, status, executor_id, evidence, created_at, updated_at, confirmed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?)`
-  ).run(key, orderId, phone, action, imageKind, imagePath, imageSha256, imageBytes, executorId, evidence || null, now, now, now);
-  dbMod.logEvent(db, orderId, 'envio_confirmado', `${action} key=${key} evidencia=${evidence || '?'}`);
-  return { record: getLedgerByKey(db, key), duplicate: false };
-}
-
 // Marca um envio como incerto e joga o pedido para REVISAO. Sem reenvio automático:
 // só um humano (ou uma nova decisão explícita) tira o pedido de REVISAO.
 function markUncertain(db, key, reason) {
@@ -250,11 +383,13 @@ function versionHashForPhotos(photos) {
 module.exports = {
   dedupKey,
   getLedgerByKey,
+  getReservationById,
+  reserveSend,
+  confirmReservedSend,
   listLedger,
   guardSend,
   cancelPending,
   confirmSend,
-  confirmSendForPhoto,
   confirmSendOverride,
   markUncertain,
   getLease,

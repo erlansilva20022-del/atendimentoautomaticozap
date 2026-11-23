@@ -25,6 +25,10 @@
 // recusam o envio ANTES de mandar. Envio incerto joga o pedido para REVISAO.
 // FC Core v2.1.0: envio automático EXIGE lease válido do executor; confirmação
 // EXIGE whatsappMessageId; rotas de dados do cliente exigem autenticação.
+// FC Core v2.1.1: reserva atômica de envio (POST /api/sends/reserve) — a extensão
+// reserva ANTES de clicar no WhatsApp; mark-preview-sent/mark-final-sent só
+// confirmam com o reservationId + whatsappMessageId, dentro do TTL e com o lease
+// ainda válido. Sem reserva, não há confirmação no fluxo automático.
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -231,9 +235,13 @@ function createBridgeRouter(db, whatsapp) {
   });
 
   // Registra o envio da prévia confirmado pela extensão (rota protegida).
-  // A extensão só chama depois de confirmar o balão de foto no WhatsApp, e
-  // passa a evidência (id da mensagem). Confirma o registro de envio e avança
-  // o pedido. Idempotente: confirmar de novo não duplica nada.
+  // FC Core v2.1.1: a confirmação EXIGE uma reserva prévia (reservationId) —
+  // sem reserva não há confirmação no fluxo automático (fecha a brecha da
+  // v2.1.0, em que mark-preview-sent registrava um envio confirmado "do nada").
+  // Fluxo da extensão: acquire lease → POST /api/sends/reserve → clica no
+  // WhatsApp → POST mark-preview-sent { reservationId, whatsappMessageId }.
+  // Reserva expirada → 409 'reservation_expired' e o pedido vai para REVISAO.
+  // Idempotente: confirmar de novo com a mesma evidência não duplica nada.
   // FC Core v2.1.0: whatsappMessageId é OBRIGATÓRIO — sem evidência verificável,
   // a confirmação é recusada com 400 (não existe mais confirmação "sem id").
   router.post('/api/orders/:id/mark-preview-sent', requireBridge, (req, res) => {
@@ -242,19 +250,27 @@ function createBridgeRouter(db, whatsapp) {
       if (!order) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
       const previews = dbMod.listPhotos(db, req.params.id, 'preview');
       if (previews.length === 0) return res.status(400).json({ ok: false, error: 'prévia ainda não gerada' });
-      const preview = previews[previews.length - 1];
       const evidence = req.body && req.body.whatsappMessageId;
       if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
         return res.status(400).json({ ok: false, error: 'whatsappMessageId é obrigatório para confirmar o envio' });
       }
+      const reservationId = req.body && req.body.reservationId;
+      if (!reservationId || typeof reservationId !== 'string' || !reservationId.trim()) {
+        return res.status(409).json({ ok: false, error: 'reserva de envio é obrigatória — reserve antes de enviar (POST /api/sends/reserve)', reason: 'no_reservation' });
+      }
       const executorId = (req.body && req.body.executorId) || null;
-      const { record, duplicate } = ledger.confirmSendForPhoto(db, {
-        orderId: order.id, phone: order.phone, action: 'preview', imageKind: 'preview',
-        imagePath: preview.path, imageSha256: preview.sha256, imageBytes: preview.bytes,
-        executorId, evidence: evidence.trim(),
+      const result = ledger.confirmReservedSend(db, {
+        reservationId: reservationId.trim(), evidence: evidence.trim(), executorId,
       });
+      if (result.error) {
+        const status = 409;
+        if (result.error === 'reservation_expired') {
+          return res.status(status).json({ ok: false, error: 'reserva expirada — envio incerto, pedido em REVISAO', reason: 'reservation_expired', needsReview: true });
+        }
+        return res.status(status).json({ ok: false, error: `confirmação recusada (${result.error})`, reason: result.error });
+      }
       const updated = service.markPreviewSent(req.params.id);
-      return res.json({ ok: true, order: updated, ledger: record, duplicate });
+      return res.json({ ok: true, order: updated, ledger: result.record, duplicate: result.duplicate });
     } catch (err) {
       return res.status(400).json({ ok: false, error: err.message });
     }
@@ -293,29 +309,37 @@ function createBridgeRouter(db, whatsapp) {
   // fica registrado no ledger com a evidência, mas a transição falha e o pedido
   // vai para revisão manual.
   // FC Core v2.1.0: whatsappMessageId é OBRIGATÓRIO.
+  // FC Core v2.1.1: também exige reservationId (reserva prévia via /api/sends/reserve).
   router.post('/api/orders/:id/mark-final-sent', requireBridge, (req, res) => {
     const order = dbMod.getOrder(db, req.params.id);
     if (!order) return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
     const finals = dbMod.listPhotos(db, req.params.id, 'final');
     if (finals.length === 0) return res.status(400).json({ ok: false, error: 'arquivo final não encontrado' });
-    const versionHash = ledger.versionHashForPhotos(finals);
     const evidence = req.body && req.body.whatsappMessageId;
     if (!evidence || typeof evidence !== 'string' || !evidence.trim()) {
       return res.status(400).json({ ok: false, error: 'whatsappMessageId é obrigatório para confirmar o envio' });
     }
+    const reservationId = req.body && req.body.reservationId;
+    if (!reservationId || typeof reservationId !== 'string' || !reservationId.trim()) {
+      return res.status(409).json({ ok: false, error: 'reserva de envio é obrigatória — reserve antes de enviar (POST /api/sends/reserve)', reason: 'no_reservation' });
+    }
     const executorId = (req.body && req.body.executorId) || null;
-    const { record } = ledger.confirmSendForPhoto(db, {
-      orderId: order.id, phone: order.phone, action: 'final', imageKind: 'final',
-      imagePath: finals[0].path, imageSha256: versionHash,
-      imageBytes: finals.reduce((s, f) => s + f.bytes, 0), executorId, evidence: evidence.trim(),
+    const result = ledger.confirmReservedSend(db, {
+      reservationId: reservationId.trim(), evidence: evidence.trim(), executorId,
     });
+    if (result.error) {
+      if (result.error === 'reservation_expired') {
+        return res.status(409).json({ ok: false, error: 'reserva expirada — envio incerto, pedido em REVISAO', reason: 'reservation_expired', needsReview: true });
+      }
+      return res.status(409).json({ ok: false, error: `confirmação recusada (${result.error})`, reason: result.error });
+    }
     try {
       const updated = service.markFinalDelivered(req.params.id);
-      return res.json({ ok: true, order: updated, ledger: record });
+      return res.json({ ok: true, order: updated, ledger: result.record, duplicate: result.duplicate });
     } catch (err) {
       dbMod.logEvent(db, req.params.id, 'final_enviado_estado_invalido', err.message);
       return res.status(400).json({
-        ok: false, error: err.message, ledger: record,
+        ok: false, error: err.message, ledger: result.record,
         note: 'envio registrado no ledger com evidência, mas a transição de estado falhou — revisar manualmente',
       });
     }
@@ -351,6 +375,48 @@ function createBridgeRouter(db, whatsapp) {
 
   router.get('/api/leases/:phone', requireClientData, (req, res) => {
     return res.json({ ok: true, lease: ledger.getLease(db, req.params.phone) });
+  });
+
+  // FC Core v2.1.1 — reserva atômica de envio (token da ponte).
+  // A extensão chama ANTES de clicar no WhatsApp: o Core cria um registro
+  // 'pending' com reservation_id + expiração, de forma atômica, SÓ se o executor
+  // detém um lease válido da conversa, não há envio confirmado/incerto/em
+  // andamento para a chave e o hash pertence a uma foto registrada do pedido
+  // com o tipo certo. A confirmação (mark-preview-sent / mark-final-sent) só
+  // vale com esse reservationId, dentro do TTL e com o lease ainda válido.
+  // Corpo: { orderId, phone, action ('preview'|'final'), imageKind, imageSha256,
+  //          executorId, ttlSeconds? (padrão 600) }.
+  router.post('/api/sends/reserve', requireBridge, (req, res) => {
+    const { orderId, phone, action, imageKind, imageSha256, executorId, ttlSeconds } = req.body || {};
+    if (!orderId || !phone || !action || !imageKind || !imageSha256 || !executorId) {
+      return res.status(400).json({ ok: false, error: 'orderId, phone, action, imageKind, imageSha256 e executorId são obrigatórios' });
+    }
+    try {
+      const ttlMs = ttlSeconds ? Math.max(1, Number(ttlSeconds)) * 1000 : undefined;
+      const result = ledger.reserveSend(db, {
+        orderId, phone, action, imageKind, imageSha256, executorId,
+        ...(ttlMs ? { ttlMs } : {}),
+      });
+      if (!result.ok) {
+        const statusByError = {
+          pedido_nao_encontrado: 404,
+          phone_nao_confere: 400,
+          hash_nao_registrado_no_pedido: 400,
+          dados_incompletos: 400,
+          acao_invalida: 400,
+          executor_obrigatorio: 400,
+          no_lease: 409,
+          duplicate: 409,
+          uncertain: 409,
+          in_progress: 409,
+        };
+        const status = statusByError[result.error] || 409;
+        return res.status(status).json({ ok: false, error: `reserva recusada (${result.error})`, reason: result.error, existing: result.existing || null });
+      }
+      return res.json({ ok: true, reservationId: result.reservationId, dedupKey: result.dedupKey, expiresAt: result.expiresAt, ledger: result.record });
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
   });
 
   // Registro de envios (somente leitura). ?orderId= filtra por pedido.

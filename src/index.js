@@ -124,6 +124,16 @@ function main() {
   const db = dbMod.initDb();
   log('info', 'banco pronto', { databasePath: config.databasePath });
 
+  // FC Core v2.1.1 — envios interrompidos por reinício vão para revisão ANTES
+  // de qualquer trabalho novo: um envio em 'in_progress' tem resultado
+  // desconhecido e nunca volta automaticamente para a fila.
+  try {
+    const interrupted = jobsMod.markInterruptedSendJobsNeedsReview(db);
+    if (interrupted > 0) log('warn', 'inicialização: envios interrompidos em revisão', { count: interrupted });
+  } catch (err) {
+    log('error', 'inicialização: não consegui revisar envios interrompidos', { error: err.message });
+  }
+
   const client = whatsapp.startWhatsApp(db);
   const app = createServer(db, whatsapp);
   app.listen(config.port, () => {

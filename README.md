@@ -7,7 +7,7 @@ d'água primeiro**, aprova, paga — e só então recebe o **HD original sem mar
 Tudo roda **localmente no PC do dono** (Windows). Nada vai para nuvem pública,
 nenhuma foto de cliente é enviada para serviço externo sem autorização.
 
-## Arquitetura — FC Core v2.1.0 (um backend, uma extensão, um painel)
+## Arquitetura — FC Core v2.1.1 (um backend, uma extensão, um painel)
 
 ```
 WhatsApp Web (1 aba) ──┐
@@ -113,6 +113,59 @@ Muse (1 aba) ──────────┘        ▲
   registro de envios, leases e trabalhos da fila exigem token de admin OU
   token da ponte. `/health` continua público (monitoramento).
 
+## O que mudou na v2.1.1 (reserva atômica de envio — fecha a brecha da v2.1.0)
+
+Na v2.1.0 a confirmação exigia `whatsappMessageId`, mas `mark-preview-sent`
+ainda podia registrar um envio confirmado sem nenhuma reserva prévia no ledger
+e sem provar que o executor detinha um lease válido. A v2.1.1 fecha isso:
+
+- **Reserva atômica de envio:** `POST /api/sends/reserve` (token da ponte).
+  A extensão reserva ANTES de clicar no WhatsApp. A reserva só é criada se
+  o executor detém um lease válido da conversa, não há envio confirmado /
+  incerto / em andamento (reserva viva) para a chave e o hash pertence a uma
+  foto registrada do pedido, com o tipo certo (para `final`, o hash é o da
+  versão do conjunto de fotos finais). A checagem e a criação acontecem numa
+  só transação — duas extensões não reservam a mesma chave ao mesmo tempo.
+  Corpo: `{orderId, phone, action, imageKind, imageSha256, executorId,
+  ttlSeconds?}` (padrão 600 s = 10 min, `RESERVATION_TTL_SECONDS`).
+  Resposta: `{reservationId, dedupKey, expiresAt}`. Segunda reserva para a
+  mesma chave com uma reserva viva é recusada com 409 (`in_progress`); sem
+  lease, 409 (`no_lease`); hash não registrado, 400.
+  Fluxo completo da extensão: `acquire lease` → `reserve` → clica no
+  WhatsApp → `mark-preview-sent {reservationId, whatsappMessageId}`.
+- **Confirmação exige reserva:** `mark-preview-sent` e `mark-final-sent` só
+  confirmam com um `reservationId` válido — reserva `pending`, do mesmo
+  executor, com o lease ainda válido e dentro do TTL. Sem reserva → 409
+  (`no_reservation`). Reserva expirada → 409 (`reservation_expired`) e o
+  envio vai para `uncertain` + pedido em `REVISAO` (o clique pode ter
+  acontecido e a confirmação chegado tarde — só revisão manual resolve).
+  Lease inválido na confirmação → 409 (`no_lease`) e a reserva continua viva
+  até expirar (a extensão pode renovar o lease e tentar de novo). Confirmar
+  de novo com a mesma evidência continua idempotente. O override de admin
+  continua como estava (registra quem e por quê, nunca automático).
+- **Envios interrompidos por reinício:** na inicialização, trabalhos de envio
+  (`send_preview`/`send_final`) que ficaram `in_progress` vão DIRETO para
+  `needs_review` — nunca voltam automaticamente para a fila. O worker também
+  não reenfileira mais envios travados (só leituras/downloads/verificações
+  voltam, com backoff). Um envio interrompido tem resultado desconhecido —
+  só revisão manual, com conferência no histórico do WhatsApp, decide.
+- **Heartbeat com expiração no `/health`:** sem heartbeat dentro de
+  `HEARTBEAT_TTL_SECONDS` (padrão 120 s), a extensão vira `stale` e a sessão
+  do WhatsApp vira `unknown` — nunca é mostrada como autenticada
+  indefinidamente. O `/health` expõe `heartbeatTtlSeconds`, `heartbeatAgeMs`
+  e `lastHeartbeat`.
+- **Reconciliação com validação estrita:** cada entrada de
+  `POST /api/admin/reconcile-historical-sends` agora valida que o tipo da
+  imagem é o tipo da foto registrada com aquele hash (`image_kind_nao_confere`
+  se o hash for de outro tipo), que o telefone é o do pedido e que o
+  `whatsappMessageId` tem o formato real do WhatsApp Web (prefixo `wamid.` —
+  texto genérico vira `evidencia_invalida`). Cada falha vira `review` com o
+  motivo específico, nunca confirmado.
+- **`/api/muse/orders` continua sem token nesta versão** — decisão consciente,
+  mantida na v2.1.1: o GPT recomendou exigir `x-bridge-token` só numa
+  atualização coordenada com a extensão unificada, que ainda não está pronta.
+  Reavaliar quando a extensão unificada estiver instalada.
+
 ## O fluxo
 
 1. Cliente manda mensagem → saudação + tabela de preços (PT-BR ou ES-MX conforme o número).
@@ -181,7 +234,7 @@ pasta `session/` — não apague.
 
 | Método | Rota | Para quê |
 |---|---|---|
-| GET | `/health` | versão, `frontdeskMode: "muse"`, banco, fila persistente (só trabalhos pendentes), leases, envio automático, contagem por status, envios confirmados/incertos/bloqueados, estados do Core/extensão/sessão WhatsApp, disco livre, último backup |
+| GET | `/health` | versão, `frontdeskMode: "muse"`, banco, fila persistente (só trabalhos pendentes), leases, envio automático, contagem por status, envios confirmados/incertos/bloqueados, estados do Core/extensão/sessão WhatsApp (heartbeat com expiração — `stale`/`unknown` sem heartbeat no TTL), disco livre, último backup |
 | GET | `/` | painel de operações (pedidos, detalhe, envios, fila de trabalhos, erros, importação) |
 | GET | `/api/orders` | lista de pedidos (autenticada: admin ou ponte) |
 | GET | `/api/orders/:id` | status, fotos, eventos, registro de envios e trabalhos da fila do pedido (autenticada) |
@@ -189,6 +242,7 @@ pasta `session/` — não apague.
 | GET | `/api/leases/:phone` | lease ativo da conversa (se houver) (autenticada) |
 | POST | `/api/leases/acquire` | extensão adquire o lease da conversa `{phone, executorId, ttlSeconds?}` (token da ponte) |
 | POST | `/api/leases/release` | extensão libera o lease `{phone, executorId}` (token da ponte) |
+| POST | `/api/sends/reserve` | **v2.1.1** — extensão reserva o envio antes de clicar no WhatsApp `{orderId, phone, action, imageKind, imageSha256, executorId, ttlSeconds?}` (token da ponte) — devolve `{reservationId, dedupKey, expiresAt}` |
 | POST | `/api/jobs` | admin — cria um trabalho na fila persistente `{orderId, step, kind, payload?, owner?, maxAttempts?, deadline?}` |
 | GET | `/api/jobs` | trabalhos da fila (`?status=` `?orderId=`) (autenticada) |
 | GET | `/api/jobs/:id` | um trabalho da fila (autenticada) |
@@ -197,15 +251,15 @@ pasta `session/` — não apague.
 | POST | `/api/muse/orders` | handoff do Muse: cria/recupera pedido por `{phone, observedClock, text}` (sem messageId nativo — fingerprint telefone+hora+texto) |
 | POST | `/api/muse/order-result` | handoff do Muse: recebe a imagem gerada `{orderId, phone, source:"MUSE", sourceSha256, image}` (dataUrl ou base64); confere o SHA-256 e salva o original |
 | GET | `/api/orders/:id/preview-file` | baixa a prévia com marca (token da ponte) |
-| POST | `/api/orders/:id/mark-preview-sent` | extensão confirma o envio da prévia com evidência `{whatsappMessageId, executorId?}` (token da ponte) — `whatsappMessageId` é obrigatório |
-| POST | `/api/orders/:id/mark-final-sent` | extensão confirma o envio do HD com evidência (token da ponte) — `whatsappMessageId` é obrigatório |
+| POST | `/api/orders/:id/mark-preview-sent` | extensão confirma o envio da prévia **com reserva prévia** `{reservationId, whatsappMessageId, executorId?}` (token da ponte) — `reservationId` e `whatsappMessageId` são obrigatórios; reserva expirada → 409 `reservation_expired` + pedido em REVISAO |
+| POST | `/api/orders/:id/mark-final-sent` | extensão confirma o envio do HD **com reserva prévia** `{reservationId, whatsappMessageId, executorId?}` (token da ponte) — mesmos requisitos da prévia |
 | POST | `/api/orders/:id/mark-preview-sent-override` | admin — confirmação manual do dono sem whatsappMessageId, com `{reason, overriddenBy}` registrados; nunca usada pelo fluxo automático |
 | POST | `/api/orders/:id/confirm-payment` | admin — confirma pagamento |
 | POST | `/api/orders/:id/send-preview` | admin — envia a prévia com marca (trava anti-duplicação + lease) |
 | POST | `/api/orders/:id/send-final` | admin — envia o HD (só após pagamento confirmado; trava anti-duplicação + lease) |
 | POST | `/api/admin/import-bridge3007` | admin — importa o histórico da Bridge 3007 a partir de um JSON exportado |
 | GET | `/api/admin/import-conflicts` | admin — conflitos da importação, para revisão manual |
-| POST | `/api/admin/reconcile-historical-sends` | admin — registra envios históricos confirmados no ledger, sem reenviar e sem mudar estados `{entries: [{orderId, phone, action, imageKind, sha256, whatsappMessageId}]}` |
+| POST | `/api/admin/reconcile-historical-sends` | admin — registra envios históricos confirmados no ledger, sem reenviar e sem mudar estados `{entries: [{orderId, phone, action, imageKind, sha256, whatsappMessageId}]}` — validação estrita (v2.1.1): tipo da imagem precisa ser o da foto registrada com aquele hash, telefone precisa ser o do pedido, `whatsappMessageId` precisa ter o formato `wamid.`; cada falha vira `review` com o motivo |
 | GET | `/api/admin/reconciliation-report` | admin — resumo da reconciliação (confirmados, em revisão, ignorados) |
 
 Rotas de admin exigem o header `x-admin-token: <ADMIN_TOKEN>`.
@@ -213,10 +267,10 @@ Rotas da ponte exigem o header `x-bridge-token: <BRIDGE_TOKEN>` quando ele está
 configurado. Rotas de dados do cliente (pedidos, detalhe, registro de envios,
 leases, trabalhos) aceitam **admin OU ponte**. Todas as rotas têm anti-duplicação
 por pedido + SHA-256, e os envios passam pelo registro de envios: duplicata,
-envio em andamento, envio incerto anterior ou lease ausente/inválido recusam
+envio em andamento, envio incerto anterior, reserva ausente/expirada ou lease ausente/inválido recusam
 o envio antes de mandar.
 
-## Modelo de autenticação (v2.1.0)
+## Modelo de autenticação (v2.1.1)
 
 | Quem | Header | Acessa |
 |---|---|---|
@@ -226,8 +280,10 @@ o envio antes de mandar.
 | Ninguém (sem token) | — | nada que exponha dados de cliente — 401 |
 
 `POST /api/muse/orders` continua sem token (é a ingestão da ponte, com
-fingerprint telefone+hora+texto para deduplicar) — decisão consciente, a
-reavaliar quando a extensão unificada estiver pronta. O backend ouve só em
+fingerprint telefone+hora+texto para deduplicar) — decisão consciente, mantida
+na v2.1.1: o GPT recomendou exigir `x-bridge-token` só numa atualização
+coordenada com a extensão unificada, que ainda não está pronta. Reavaliar
+quando a extensão unificada estiver instalada. O backend ouve só em
 `127.0.0.1` quando usado localmente; nunca exponha a porta 3008 na rede.
 
 ## Importação do histórico da Bridge 3007

@@ -19,5 +19,5 @@
     "start": "node src/index.js"
   },
   "type": "commonjs",
-  "version": "2.1.0"
+  "version": "2.1.1"
 }
